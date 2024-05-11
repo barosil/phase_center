@@ -1,0 +1,5 @@
+.micromamba
+.mypy*
+data/
+__pycache__/
+*.pyc
