@@ -39,7 +39,7 @@ def get_max_amp(data):
     return theta_0
 
 
-def normalize_PHASE(data, angle_correction=True):
+def normalize_PHASE(data, angle_correction=True, wrap=True):
     data = data.copy()
     if angle_correction:
         theta_0 = get_max_amp(data)
@@ -51,11 +51,13 @@ def normalize_PHASE(data, angle_correction=True):
 
     data["PHASE"] = data.PHASE - PHI_0
     data["delta_theta"] = theta_0
+    if not wrap:
+        data["PHASE"] = np.unwrap(data.PHASE)
     return data
 
 
 def get_data(
-    freq=1.0, mode="V", theta_max_deg=None, angle_correction=True, path="../data/raw/"
+    freq=1.0, mode="V", theta_max_deg=None, angle_correction=True, path="../data/raw/", wrap=True
 ):
     dataset_H = path + "beampattern_horn01_Polarização_Horizontal_Copolar.csv"
     dataset_V = path + "beampattern_horn01_Polarização_Vertical_Copolar.csv"
@@ -66,10 +68,11 @@ def get_data(
     data = data.query("FREQ==@freq").copy().reset_index(drop=True)
     data.ANGLE = np.radians(data.ANGLE)
     data.PHASE = np.radians(data.PHASE)
+    data.PHASE = (data.PHASE.values + data.PHASE.values[::-1]) / 2
     # Normalize amplitudes such that the maximum amplitude is 0 dB.
     data = normalize_AMP(data)
     # Normalize phases such that the phase at the maximum amplitude is 0.
-    data = normalize_PHASE(data, angle_correction=angle_correction)
+    data = normalize_PHASE(data, angle_correction=angle_correction, wrap=wrap)
     if theta_max_deg is not None:
         data = cut_theta(data, theta_max_deg)
     return data
@@ -93,19 +96,22 @@ def weight_Amp(data) -> np.ndarray:
     return 10 ** (data / 10)
 
 
-def model(DXY: float, DZ: float, theta):
-    Phi = wrap_angle(DXY * np.sin(theta) + DZ * np.cos(theta))
+def model(DXY: float, DZ: float, theta, wrap=True) -> np.ndarray:
+    if wrap:
+        Phi = wrap_angle(DXY * np.sin(theta) + DZ * np.cos(theta))
+    else:
+        Phi = DXY * np.sin(theta) + DZ * np.cos(theta)
     return Phi
 
 
-def residuals(DXY, DZ, theta, Phase, weights) -> np.ndarray:
+def residuals(DXY, DZ, theta, Phase, weights, wrap=True, mode="V") -> np.ndarray:
+    if mode == "H":
+        Phase = Phase + np.pi / 2
     NORM = 1 / np.sum(weights)
-    res = (
-        (1 / 2)
-        * NORM
-        * weights
-        * np.abs((wrap_angle(Phase - model(DXY, DZ, theta))) ** 2)
-    )
+    if wrap:
+        res = (1 / 2) * NORM * weights * np.abs((wrap_angle(Phase - model(DXY, DZ, theta, wrap=wrap))) ** 2)
+    else:
+        res = (1 / 2) * NORM * weights * np.abs((Phase - model(DXY, DZ, theta, wrap=wrap)) ** 2)
     return res
 
 
@@ -117,30 +123,30 @@ def res2fit(params, theta, data):
     return res
 
 
-def chi_2(DXY, DZ, theta, Phase, weights):
-    res = np.sum(residuals(DXY, DZ, theta, Phase, weights), axis=1)
+def chi_2(DXY, DZ, theta, Phase, weights, mode="V"):
+    res = np.sum(residuals(DXY, DZ, theta, Phase, weights, mode=mode), axis=1)
     return res
 
 
-def _chi_2(DXY, DZ, data, weight_func):
+def _chi_2(DXY, DZ, data, weight_func, wrap=True, mode="V"):
     theta = data.ANGLE.values
     Phase = data.PHASE.values
     weights = weight_func(data.AMPLITUDE.values)
-    res = np.sum(residuals(DXY, DZ, theta, Phase, weights), axis=1)
+    res = np.sum(residuals(DXY, DZ, theta, Phase, weights, wrap=wrap, mode=mode), axis=1)
     return res
 
 
-def fit_phase_center(DZ, theta, Phase, weights):
+def fit_phase_center(DZ, theta, Phase, weights, wrap=True, mode="V"):
     params = lmfit.Parameters()
     params.add("DXY", value=0.0)
-    params.add("DZ", value=DZ, min=-np.pi, max=np.pi)
+    params.add("DZ", value=DZ)
 
     # Cost function in lmfit format
     def res(params):
         params = params.valuesdict()
         DXY = params["DXY"]
         DZ = params["DZ"]
-        return residuals(DXY, DZ=DZ, theta=theta, Phase=Phase, weights=weights)
+        return residuals(DXY, DZ=DZ, theta=theta, Phase=Phase, weights=weights, wrap=wrap, mode=mode)
 
     # Minimization
     result = lmfit.minimize(res, params)
@@ -148,7 +154,7 @@ def fit_phase_center(DZ, theta, Phase, weights):
     return result
 
 
-def chi_2_set(Z_min, Z_max, theta_max_deg, n_points=1000, angle_correction=True):
+def chi_2_set(Z_min, Z_max, theta_max_deg, n_points=1000, angle_correction=True, wrap=True):
     freqs = get_freqs()
     result = np.zeros((2, 2, len(freqs), n_points))
     fitter = np.zeros((2, 2, len(freqs)), dtype=object)
@@ -159,20 +165,20 @@ def chi_2_set(Z_min, Z_max, theta_max_deg, n_points=1000, angle_correction=True)
                     freq,
                     mode=mode,
                     theta_max_deg=theta_max_deg,
-                    angle_correction=angle_correction,
+                    angle_correction=angle_correction, wrap=wrap
                 )
 
                 DZ = np.linspace(Z_min, Z_max, n_points).reshape(-1, 1)
                 DXY = 0.0
-                chi_2 = _chi_2(DXY, DZ, data, weight_func)
+                chi_2 = _chi_2(DXY, DZ, data, weight_func, wrap=wrap, mode=mode)
                 result[ii, jj, kk] = chi_2
 
                 idx = np.argmin(chi_2)
-                DZ_0 = DZ[idx][0]
+                DZ_0 = 1
                 theta = data.ANGLE.values
                 Phase = data.PHASE.values
                 weights = weight_func(data.AMPLITUDE.values)
-                fit_ = fit_phase_center(DZ_0, theta, Phase, weights)
+                fit_ = fit_phase_center(DZ_0, theta, Phase, weights, wrap=wrap, mode=mode)
                 fitter[ii, jj, kk] = fit_
 
     return result, fitter
@@ -258,7 +264,7 @@ def plot_fit_set(fitter, Z_min=0, Z_max=15 * np.pi, ax=None, title=None):
 
 
 def plot_fit_combined(
-    fitters, ax=None, title=None, weight=0, legend=["15", "45", "90", "180"], **kwargs
+    fitters, ax=None, title=None, weight=0, D0=0, legend=["15", "45", "90", "180"], **kwargs
 ):
     freqs = get_freqs()
     if not ax:
@@ -278,7 +284,7 @@ def plot_fit_combined(
             DZerr = np.zeros_like(freqs)
             for kk, fit_ in enumerate(res_modes):
                 k_0 = k0(freqs[kk])
-                DZ[kk] = 100 * fit_.params["DZ"].value / k_0
+                DZ[kk] = D0 - 100 * fit_.params["DZ"].value / k_0
                 DZerr[kk] = 100 * fit_.params["DZ"].stderr / k_0
             ax.errorbar(
                 freqs,
