@@ -1,5 +1,5 @@
 .micromamba
 .mypy*
-data/
+data/raw/
 __pycache__/
 *.pyc
