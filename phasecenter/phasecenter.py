@@ -5,6 +5,22 @@ import scipy as sp
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from pathlib import Path
+from typing import Union
+import numpy as np
+import pandas as pd
+from scipy.constants import c
+import scipy as sp
+from pathlib import Path
+
+DATASET = [
+    "beampattern_horn01_Polarização_Horizontal_Copolar.csv",
+    "beampattern_horn01_Polarização_Vertical_Copolar.csv",
+    # "beampattern_horn01_Polarização_Horizontal_Cruzada.csv",
+    # "beampattern_horn01_Polarização_Vertical_Cruzada.csv",
+]
+
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
 
 DATASET = [
     "beampattern_horn01_Polarização_Horizontal_Copolar.csv",
@@ -14,7 +30,7 @@ DATASET = [
 ]
 
 
-def get_color(name):
+def get_color(name: str) -> str:
     pol = name[0]
     if pol == "Horizontal_Copolar":
         return "blue"
@@ -22,7 +38,7 @@ def get_color(name):
         return "red"
 
 
-def get_linewidth(name):
+def get_linewidth(name: str) -> float:
     weight = name[1]
     if weight == "Amplitude":
         return 1.0
@@ -30,7 +46,7 @@ def get_linewidth(name):
         return 0.5
 
 
-def get_linestyle(name):
+def get_linestyle(name: str) -> str:
     smooth = name[2]
     if smooth:
         return "--"
@@ -41,13 +57,13 @@ def get_linestyle(name):
 class PhaseCenter:
     def __init__(
         self,
-        bootstrap=True,
-        smooth=True,
-        dataset=DATASET,
-        theta_cut=20,
-        taper=-10,
-        D0=2.35,
-        path="../data/raw/",
+        bootstrap: bool = True,
+        smooth: bool = True,
+        dataset: list[str] = DATASET,
+        theta_cut: int = 20,
+        taper: int = -10,
+        D0: float = 2.35,
+        path: str = "../data/raw/",
     ):
         self.path = path
         self._dataset = dataset
@@ -62,33 +78,33 @@ class PhaseCenter:
         self._D0 = D0
 
     @property
-    def D0(self):
+    def D0(self) -> float:
         return self._D0
 
     @D0.setter
-    def D0(self, D0):
+    def D0(self, D0: float) -> None:
         self._D0 = D0
 
     @property
-    def dataset(self):
+    def dataset(self) -> list[str]:
         return self._dataset
 
     @dataset.setter
-    def dataset(self, dataset):
+    def dataset(self, dataset: list[str]) -> None:
         self._dataset = dataset
 
-    def _normalize_AMP(self, data):
+    def _normalize_AMP(self, data: pd.DataFrame) -> pd.DataFrame:
         data.AMPLITUDE = data.AMPLITUDE - data.AMPLITUDE.max()
         Theta_0 = data.ANGLE[data.AMPLITUDE.idxmax()]
         data.ANGLE = data.ANGLE - Theta_0
         return data
 
-    def _normalize_PHASE(self, data):
+    def _normalize_PHASE(self, data: pd.DataFrame) -> pd.DataFrame:
         PHI_0 = data[data.ANGLE == 0]["PHASE"].values[0]
         data["PHASE"] = np.unwrap(data.PHASE - PHI_0)
         return data
 
-    def _get_taper_angle(self, data):
+    def _get_taper_angle(self, data: pd.DataFrame) -> np.ndarray:
         data_interp = sp.interpolate.interp1d(data["ANGLE"], data["AMPLITUDE"])
         taper_angle = sp.optimize.minimize(
             lambda angle: np.abs(data_interp(angle) - self.taper),
@@ -97,13 +113,13 @@ class PhaseCenter:
         ).x[0]
         return taper_angle * np.ones(data["ANGLE"].shape)
 
-    def _get_angle_phase(self, data):
+    def _get_angle_phase(self, data: pd.DataFrame) -> np.ndarray:
         ph = sp.signal.savgol_filter(data.PHASE.values, 5, 2)
         peaks, _ = sp.signal.find_peaks(-ph, width=10)
         theta_peak = data.ANGLE.iloc[peaks].abs().min()
         return theta_peak * np.ones(data["ANGLE"].shape)
 
-    def _load_dataset(self, file):
+    def _load_dataset(self, file: str) -> pd.DataFrame:
         data = (
             pd.read_csv(file)
             .query("ANGLE > -@self.theta_cut & ANGLE < @self.theta_cut")
@@ -148,23 +164,29 @@ class PhaseCenter:
             ).reset_index(drop=True)
         return data_
 
-    def _load_data(self):
+    def _load_data(self) -> "PhaseCenter":
         filenames = [self.path + file for file in self.dataset]
         data = pd.concat([self._load_dataset(filename) for filename in filenames])
         self.data = data
         return self
 
-    def _smooth_func(self, phase):
+    def _smooth_func(self, phase: np.ndarray) -> np.ndarray:
         return sp.signal.savgol_filter(phase.values, 20, 2)
 
-    def _smooth_phases(self, data):
+    def _smooth_phases(self, data: pd.DataFrame) -> np.ndarray:
         phases = []
         for gr, group in data.groupby(["DATASET", "FREQ"]):
             phases.append(self._smooth_func(group.PHASE))
         phases = np.concatenate(phases)
         return phases
 
-    def fit_phase(self, model=None, bootstrap=None, smooth=None, sigma_func=None):
+    def fit_phase(
+        self,
+        model: Union[None, callable] = None,
+        bootstrap: Union[None, bool] = None,
+        smooth: Union[None, bool] = None,
+        sigma_func: Union[None, callable] = None,
+    ) -> Union[pd.DataFrame, None]:
         if bootstrap is None:
             bootstrap = self.bootstrap
         if smooth is None:
@@ -238,7 +260,6 @@ class PhaseCenter:
                 yield fit
             else:
                 return fit
-
     def set_guess(self):
         self.guess = next(self.fit_phase())
         return self
@@ -290,7 +311,19 @@ class PhaseCenter:
         perr = np.sqrt(np.diag(pcov))
         return [*param, *perr]
 
-    def run_bootstrap(self, sigma_func=None, smooth=True, n=100):
+    def run_bootstrap(self, sigma_func=None, smooth: bool = True, n: int = 100) -> "PhaseCenter":
+        """
+        Runs the bootstrap process for estimating the phase center.
+
+        Args:
+            sigma_func: A function to calculate the sigma value. If not provided, the default sigma function will be used.
+            smooth: A boolean indicating whether to apply smoothing during the bootstrap process. Default is True.
+            n: The number of iterations for the bootstrap process. Default is 100.
+
+        Returns:
+            PhaseCenter: The updated PhaseCenter object.
+
+        """
         if sigma_func is None:
             sigma_func = PhaseCenter._sigma_Amp
         for ii in range(n):
@@ -305,7 +338,7 @@ class PhaseCenter:
                 )
         return self
 
-    def _best_fit(self, data, rng=None):
+    def _best_fit(self, data: pd.DataFrame, rng: Optional[np.random.Generator] = None) -> np.ndarray:
         if rng is None:
             rng = np.random.default_rng()
         n_params = data.shape[1]
@@ -334,7 +367,13 @@ class PhaseCenter:
             values = np.ravel(values)
         return values
 
-    def run_best_fit(self):
+    def run_best_fit(self) -> "PhaseCenter":
+        """
+        Runs the best fit algorithm on the parameters and returns a PhaseCenter object.
+
+        Returns:
+            PhaseCenter: The PhaseCenter object with the best fit results.
+        """
         cols_orig = ["DATASET", "WEIGHT", "SMOOTH", "FREQ", 0, 1, 2, 3, 4, 5, 6, 7, 8]
         bv_names = [
             "DATASET",
@@ -362,7 +401,7 @@ class PhaseCenter:
         self.best_fit = best_fit
         return self
 
-    def _predict(self, params, group):
+    def _predict(self, params: pd.DataFrame, group: Tuple) -> np.ndarray:
         angles = self.data.query("DATASET == @group[0] & FREQ == @group[-1]")[
             "ANGLE"
         ].values
@@ -371,13 +410,14 @@ class PhaseCenter:
 
         return result
 
-    def predict(self):
+    def predict(self) -> "PhaseCenter":
+        """
+        Predicts the phase center based on the best fit parameters.
+
+        Returns:
+            PhaseCenter: The PhaseCenter object with the predicted phase center values.
+        """
         res = self.best_fit.copy()
-        # res[["WEIGHT", "SMOOTH", "PREDICTED"]] = (
-        #     res.groupby(["DATASET", "FREQ"])[["ANGLE", "PHASE"]]
-        #     .apply(lambda data: self._cal_model(data, group=data.name))
-        #     .reset_index(drop=True)
-        # )
         params = self.best_fit.groupby(["DATASET", "WEIGHT", "SMOOTH", "FREQ"])[
             ["DZ", "PHI_0", "DXY"]
         ]
@@ -406,55 +446,69 @@ class PhaseCenter:
         self.predicted = pd.concat(results)
         return self
 
-    def score_R2(data):
+    def score_R2(self, data: pd.DataFrame) -> float:
         return 1 - np.sum((data.PHASE - data.PREDICTED) ** 2) / np.sum(
             (data.PHASE - data.PHASE.mean()) ** 2
         )
 
-    def score_Chi2(data):
+    def score_Chi2(self, data: pd.DataFrame) -> float:
         return np.sum((data.PHASE - data.PREDICTED) ** 2 / (data.shape[0] - 3))
 
-    def score_p(data):
+    def score_p(self, data: pd.DataFrame) -> float:
         return sp.stats.chisquare(data.PHASE, data.PREDICTED)[1]
 
-    def test_cramer(data):
+    def test_cramer(self, data: pd.DataFrame) -> float:
         try:
             res = sp.stats.cramervonmises_2samp(data.PHASE, data.PREDICTED)
         except ValueError:
             return np.nan
         return res.pvalue
 
-    def test_KS(data):
+    def test_KS(self, data: pd.DataFrame) -> float:
         res = sp.stats.ks_2samp(data.PHASE, data.PREDICTED)[1]
         return res
 
-    def test_KS_res(data):
+    def test_KS_res(self, data: pd.DataFrame) -> float:
         res = data.PHASE - data.PREDICTED
         test = sp.stats.kstest(res, sp.stats.norm.cdf)[1]
         return test
 
-    def score(self):
-        res = (
-            self.predicted.groupby(["DATASET", "WEIGHT", "SMOOTH", "FREQ"])
-            .apply(
-                lambda data: pd.Series(
-                    {
-                        "R2": PhaseCenter.score_R2(data),
-                        "Chi2": PhaseCenter.score_Chi2(data),
-                        "cramer": PhaseCenter.test_cramer(data),
-                        "KS": PhaseCenter.test_KS(data),
-                        "KS_res": PhaseCenter.test_KS_res(data),
-                    }
+    def score(self) -> "PhaseCenter":
+            """
+            Calculate various scores for the predicted data and update the best_fit attribute.
+
+            Returns:
+                PhaseCenter: The updated PhaseCenter object.
+            """
+            res = (
+                self.predicted.groupby(["DATASET", "WEIGHT", "SMOOTH", "FREQ"])
+                .apply(
+                    lambda data: pd.Series(
+                        {
+                            "R2": PhaseCenter.score_R2(data),
+                            "Chi2": PhaseCenter.score_Chi2(data),
+                            "cramer": PhaseCenter.test_cramer(data),
+                            "KS": PhaseCenter.test_KS(data),
+                            "KS_res": PhaseCenter.test_KS_res(data),
+                        }
+                    )
                 )
+                .reset_index()
             )
-            .reset_index()
-        )
-        self.best_fit = pd.merge(
-            self.best_fit, res, on=["DATASET", "WEIGHT", "SMOOTH", "FREQ"], how="inner"
-        )
-        return self
+            self.best_fit = pd.merge(
+                self.best_fit, res, on=["DATASET", "WEIGHT", "SMOOTH", "FREQ"], how="inner"
+            )
+            return self
 
     def report(self):
+        """
+        Generates a report for the best fit parameters.
+
+        This method calculates various parameters based on the best fit values and returns the updated object.
+
+        Returns:
+            self: The updated object with calculated parameters.
+        """
         self.best_fit["Wavelength_cm"] = 100 * c / (self.best_fit["FREQ"] * 1e9)
         self.best_fit["DZ"] = (
             self.D0 / self.best_fit.Wavelength_cm - self.best_fit["DZ"] / 2 / np.pi
@@ -497,6 +551,15 @@ class PhaseCenter:
         return self
 
     def save(self, path="../data/processed"):
+        """
+        Save the best fit, predicted, and data as CSV files.
+
+        Args:
+            path (str, optional): The path to save the files. Defaults to "../data/processed".
+
+        Returns:
+            self: The current instance of the class.
+        """
         timestamp = pd.Timestamp.now().strftime("%Y_%_m%d_%H_%M_%S")
         self.best_fit.to_csv(f"{path}/best_fit_{timestamp}.csv", index=False)
         self.predicted.to_csv(f"{path}/predicted_{timestamp}.csv", index=False)
@@ -504,6 +567,16 @@ class PhaseCenter:
         return self
 
     def plot_phase_center(self, ax=None):
+        """
+        Plot the phase center data.
+
+        Parameters:
+        - ax (matplotlib.axes.Axes, optional): The axes to plot on. If not provided, a new figure with subplots will be created.
+
+        Returns:
+        - ax (matplotlib.axes.Axes): The axes object containing the plot.
+
+        """
         if ax is None:
             fig, ax = plt.subplots(nrows=2, ncols=2, figsize=(8, 4))
         for name, data in self.best_fit.groupby(["DATASET", "WEIGHT", "SMOOTH"]):
@@ -560,6 +633,16 @@ class PhaseCenter:
         return ax
 
     def plot_statistics(self, ax=None):
+        """
+        Plots various statistics using the provided axes.
+
+        Parameters:
+            ax (matplotlib.axes.Axes, optional): The axes to plot the statistics on. If not provided, a new figure with
+                subplots will be created.
+
+        Returns:
+            matplotlib.axes.Axes: The axes object containing the plotted statistics.
+        """
         if ax is None:
             fig, ax = plt.subplots(nrows=3, ncols=2, figsize=(8, 2 * 3))
 
@@ -616,6 +699,17 @@ class PhaseCenter:
         return ax
 
     def plot_phases(self, freqs=None, ncols=3, ax=None):
+        """
+        Plot the phases of the predicted data.
+
+        Parameters:
+        - freqs (list or None): List of frequencies to plot. If None, all unique frequencies in the best_fit data will be plotted.
+        - ncols (int): Number of columns in the subplot grid.
+        - ax (matplotlib.axes.Axes or None): Axes object to plot on. If None, a new figure and axes will be created.
+
+        Returns:
+        - ax (matplotlib.axes.Axes): The axes object containing the plotted phases.
+        """
         if freqs is None:
             freqs = self.best_fit.FREQ.unique()
         ncols = 4
@@ -704,6 +798,18 @@ class PhaseCenter:
         return ax
 
     def plot_residuals(self, freqs=None, ncols=3, ax=None):
+        """
+        Plot the residuals of the predicted phase compared to the measured phase.
+
+        Parameters:
+        - freqs (list or None): List of frequencies to plot. If None, all unique frequencies in the dataset will be plotted.
+        - ncols (int): Number of columns in the subplot grid.
+        - ax (matplotlib.axes.Axes or None): Axes object to plot on. If None, a new figure and axes will be created.
+
+        Returns:
+        - ax (matplotlib.axes.Axes): Axes object containing the plotted residuals.
+
+        """
         if freqs is None:
             freqs = self.best_fit.FREQ.unique()
         ncols = 4
@@ -794,6 +900,17 @@ class PhaseCenter:
         return ax
 
     def plot_qq_residuals(self, freqs=None, ncols=4, ax=None):
+        """
+        Plot quantile-quantile (QQ) residuals for different frequencies.
+
+        Parameters:
+        - freqs (list or None): List of frequencies to plot QQ residuals for. If None, all unique frequencies in the dataset will be used.
+        - ncols (int): Number of columns in the subplot grid.
+        - ax (matplotlib.axes.Axes or None): Axes object to plot the QQ residuals on. If None, a new figure and axes will be created.
+
+        Returns:
+        - ax (matplotlib.axes.Axes): Axes object containing the QQ residual plots.
+        """
         markers = ["1", "o", "+", "D"]
         freqs = self.best_fit.FREQ.unique()[::4]
         if freqs is None:
@@ -881,11 +998,37 @@ class PhaseCenter:
         return ax
 
     def get_recent_file(path, mask):
+        """
+        Get the most recent file in a directory that matches a given mask.
+
+        Args:
+            path (str): The directory path to search for files.
+            mask (str): The file mask to match.
+
+        Returns:
+            str: The path of the most recent file.
+
+        Raises:
+            ValueError: If no files matching the mask are found in the directory.
+        """
         files = list(Path(path).glob(mask))
+        if not files:
+            raise ValueError(f"No files matching the mask '{mask}' found in the directory '{path}'.")
         file = max(files, key=lambda file: file.stat().st_ctime)
         return file
 
     def load(self, path, files=None):
+        """
+        Load the data from CSV files.
+
+        Args:
+            path (str): The path to the directory containing the CSV files.
+            files (list): A list of file names to load. If None, default file names will be used.
+
+        Returns:
+            self: The PhaseCenter object with the loaded data.
+
+        """
         if files is None:
             masks = ["best_fit*.csv", "predicted*.csv", "data*.csv"]
             files = [PhaseCenter.get_recent_file(path, mask) for mask in masks]
