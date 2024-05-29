@@ -11,16 +11,10 @@ import pandas as pd
 from scipy.constants import c
 import scipy as sp
 from pathlib import Path
-
-DATASET = [
-    "beampattern_horn01_Polarização_Horizontal_Copolar.csv",
-    "beampattern_horn01_Polarização_Vertical_Copolar.csv",
-    # "beampattern_horn01_Polarização_Horizontal_Cruzada.csv",
-    # "beampattern_horn01_Polarização_Vertical_Cruzada.csv",
-]
-
+from typing import Union, Optional, Tuple
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
+
 
 DATASET = [
     "beampattern_horn01_Polarização_Horizontal_Copolar.csv",
@@ -67,6 +61,8 @@ class PhaseCenter:
     ):
         self.path = path
         self._dataset = dataset
+        self.sigma_theta = np.radians(0.1)
+        self.sigma_phase = np.radians(1)
         self.theta_cut = theta_cut
         self.taper = taper
         self.bootstrap = bootstrap
@@ -76,6 +72,7 @@ class PhaseCenter:
         self.params = pd.DataFrame()
         self.best_fit = None
         self._D0 = D0
+        self.GROUPS = ["DATASET", "WEIGHT", "SMOOTH", "FREQ", "METHOD"]
 
     @property
     def D0(self) -> float:
@@ -260,6 +257,8 @@ class PhaseCenter:
                 yield fit
             else:
                 return fit
+            
+            
     def set_guess(self):
         self.guess = next(self.fit_phase())
         return self
@@ -273,7 +272,6 @@ class PhaseCenter:
         return data
 
     def _wrap_angle(theta: np.ndarray) -> np.ndarray:
-        # result = (theta + np.pi) % (2 * np.pi) - np.pi
         result = np.arctan2(np.sin(theta), np.cos(theta))
         return result
 
@@ -290,9 +288,19 @@ class PhaseCenter:
     def model(theta, DZ, PHI0, DXY: float) -> np.ndarray:
         Phi = DXY * np.sin(theta) + DZ * np.cos(theta) + PHI0
         return Phi
-
+    
+    def _fit_odr(X, y, model, sx, sy, guess):
+        model_odr = sp.odr.Model(model)
+        DATA = sp.odr.RealData(X, y, sx=sx, sy=sy)
+        result = sp.odr.ODR(DATA, model_odr, beta0=guess).run()
+        param = (result.beta[0], result.beta[1], result.beta[2])
+        perr = (result.sd_beta[0], result.sd_beta[1], result.sd_beta[2])
+        y_pred = result.y
+        return param, perr, y_pred
+        
+        
     def _fit_phase_center(
-        self, data, model, sigma_func, phase_str="PHASE", bootstrap=False, group=None
+        self, data, model, sigma_func, phase_str="PHASE", bootstrap=False, group=None, errors=False
     ):
         if bootstrap:
             idx = np.random.choice(data.index, size=len(data), replace=True)
@@ -303,15 +311,25 @@ class PhaseCenter:
             guess = self.guess[
                 (self.guess.DATASET == group[0]) & (self.guess.FREQ == group[1])
             ][["DZ", "PHI_0", "DXY"]].values[0]
-        sigma = sigma_func(data.AMPLITUDE)
-        popt, pcov = sp.optimize.curve_fit(
-            model, data.ANGLE, data[phase_str], p0=guess, sigma=sigma, maxfev=10000
-        )
-        param = popt
-        perr = np.sqrt(np.diag(pcov))
+        if errors:
+            def _model(params, theta):
+                return model(theta, *params)
+            param, perr, _ = PhaseCenter._fit_odr(data.ANGLE, data[phase_str], _model, self.sigma_theta, self.sigma_phase, guess)
+            model_odr = sp.odr.Model(_model)
+            DATA = sp.odr.RealData(data.ANGLE, data[phase_str], sx=self.sigma_theta, sy=self.sigma_phase)
+            result = sp.odr.ODR(DATA, model_odr, beta0=guess).run()
+            param = (result.beta[0], result.beta[1], result.beta[2])
+            perr = (result.sd_beta[0], result.sd_beta[1], result.sd_beta[2])
+        else:
+            sigma = sigma_func(data.AMPLITUDE)
+            popt, pcov = sp.optimize.curve_fit(
+                model, data.ANGLE, data[phase_str], p0=guess, sigma=sigma, maxfev=10000
+            )
+            param = popt
+            perr = np.sqrt(np.diag(pcov))
         return [*param, *perr]
 
-    def run_bootstrap(self, sigma_func=None, smooth: bool = True, n: int = 100) -> "PhaseCenter":
+    def run_bootstrap(self, sigma_func=None, smooth: bool = True, n: int = 100, errors=False) -> "PhaseCenter":
         """
         Runs the bootstrap process for estimating the phase center.
 
@@ -336,6 +354,7 @@ class PhaseCenter:
                         next(self.fit_phase(sigma_func=sigma_func, smooth=smooth)),
                     ]
                 )
+            self.params["METHOD"] = "ODR" if errors else "OLS"
         return self
 
     def _best_fit(self, data: pd.DataFrame, rng: Optional[np.random.Generator] = None) -> np.ndarray:
@@ -348,8 +367,8 @@ class PhaseCenter:
             values = np.asarray(
                 [
                     data.mean()[0],
-                    res.confidence_interval[0][0],
-                    res.confidence_interval[1][0],
+                    res.confidence_interval[0][0] / data.mean()[0],
+                    res.confidence_interval[1][0] / data.mean()[0],
                 ]
             )
         else:
@@ -360,8 +379,8 @@ class PhaseCenter:
                 values[ii, :] = np.asarray(
                     [
                         data.iloc[:, ii].mean(),
-                        res.confidence_interval[0],
-                        res.confidence_interval[1],
+                        res.confidence_interval[0] / data.iloc[:, ii].mean() ,
+                        res.confidence_interval[1] / data.iloc[:, ii].mean(),
                     ]
                 )
             values = np.ravel(values)
@@ -374,12 +393,8 @@ class PhaseCenter:
         Returns:
             PhaseCenter: The PhaseCenter object with the best fit results.
         """
-        cols_orig = ["DATASET", "WEIGHT", "SMOOTH", "FREQ", 0, 1, 2, 3, 4, 5, 6, 7, 8]
-        bv_names = [
-            "DATASET",
-            "WEIGHT",
-            "SMOOTH",
-            "FREQ",
+        cols_orig = [*self.GROUPS, 0, 1, 2, 3, 4, 5, 6, 7, 8]
+        bv_names = [*self.GROUPS,
             "DZ",
             "DZ_err_low",
             "DZ_err_high",
@@ -391,7 +406,7 @@ class PhaseCenter:
             "DXY_err_high",
         ]
         best_fit = (
-            self.params.groupby(["DATASET", "WEIGHT", "SMOOTH", "FREQ"])[
+            self.params.groupby(self.GROUPS)[
                 ["DZ", "PHI_0", "DXY"]
             ]
             .apply(lambda data: pd.Series(self._best_fit(data)))
@@ -417,26 +432,32 @@ class PhaseCenter:
         Returns:
             PhaseCenter: The PhaseCenter object with the predicted phase center values.
         """
-        res = self.best_fit.copy()
-        params = self.best_fit.groupby(["DATASET", "WEIGHT", "SMOOTH", "FREQ"])[
+        params = self.best_fit.groupby(self.GROUPS)[
             ["DZ", "PHI_0", "DXY"]
         ]
         results = []
         for group, param in params:
-            angles = self.data.query("DATASET == @group[0] & FREQ == @group[-1]")[
+            angles = self.data.query("DATASET == @group[0] & FREQ == @group[-2]")[
                 "ANGLE"
             ].values
-            phases = self.data.query("DATASET == @group[0] & FREQ == @group[-1]")[
+            phases = self.data.query("DATASET == @group[0] & FREQ == @group[-2]")[
                 "PHASE"
             ].values
             guess = param.values[0]
-            predicted = PhaseCenter.model(angles, *guess)
+            if group[-1] == "ODR":
+                def _model(params, theta):
+                    return PhaseCenter.model(theta, *params)
+                _, _, predicted = PhaseCenter._fit_odr(angles, phases, _model, self.sigma_theta, self.sigma_phase, guess)
+                
+            else:
+                predicted = PhaseCenter.model(angles, *guess)
             result = pd.DataFrame(
                 {
                     "DATASET": group[0],
                     "WEIGHT": group[1],
                     "SMOOTH": group[2],
                     "FREQ": group[3],
+                    "METHOD": group[4],
                     "ANGLE": angles,
                     "PHASE": phases,
                     "PREDICTED": predicted,
@@ -446,29 +467,29 @@ class PhaseCenter:
         self.predicted = pd.concat(results)
         return self
 
-    def score_R2(self, data: pd.DataFrame) -> float:
+    def score_R2(data: pd.DataFrame) -> float:
         return 1 - np.sum((data.PHASE - data.PREDICTED) ** 2) / np.sum(
             (data.PHASE - data.PHASE.mean()) ** 2
         )
 
-    def score_Chi2(self, data: pd.DataFrame) -> float:
+    def score_Chi2(data: pd.DataFrame) -> float:
         return np.sum((data.PHASE - data.PREDICTED) ** 2 / (data.shape[0] - 3))
 
     def score_p(self, data: pd.DataFrame) -> float:
         return sp.stats.chisquare(data.PHASE, data.PREDICTED)[1]
 
-    def test_cramer(self, data: pd.DataFrame) -> float:
+    def test_cramer(data: pd.DataFrame) -> float:
         try:
             res = sp.stats.cramervonmises_2samp(data.PHASE, data.PREDICTED)
         except ValueError:
             return np.nan
         return res.pvalue
 
-    def test_KS(self, data: pd.DataFrame) -> float:
+    def test_KS(data: pd.DataFrame) -> float:
         res = sp.stats.ks_2samp(data.PHASE, data.PREDICTED)[1]
         return res
 
-    def test_KS_res(self, data: pd.DataFrame) -> float:
+    def test_KS_res(data: pd.DataFrame) -> float:
         res = data.PHASE - data.PREDICTED
         test = sp.stats.kstest(res, sp.stats.norm.cdf)[1]
         return test
@@ -481,7 +502,7 @@ class PhaseCenter:
                 PhaseCenter: The updated PhaseCenter object.
             """
             res = (
-                self.predicted.groupby(["DATASET", "WEIGHT", "SMOOTH", "FREQ"])
+                self.predicted.groupby(self.GROUPS)
                 .apply(
                     lambda data: pd.Series(
                         {
@@ -496,7 +517,7 @@ class PhaseCenter:
                 .reset_index()
             )
             self.best_fit = pd.merge(
-                self.best_fit, res, on=["DATASET", "WEIGHT", "SMOOTH", "FREQ"], how="inner"
+                self.best_fit, res, on=self.GROUPS, how="inner"
             )
             return self
 
@@ -509,48 +530,30 @@ class PhaseCenter:
         Returns:
             self: The updated object with calculated parameters.
         """
+        
         self.best_fit["Wavelength_cm"] = 100 * c / (self.best_fit["FREQ"] * 1e9)
         self.best_fit["DZ"] = (
             self.D0 / self.best_fit.Wavelength_cm - self.best_fit["DZ"] / 2 / np.pi
         )
-        self.best_fit["DZ_err_low"] = np.abs(
-            self.best_fit["DZ_err_low"] / 2 / np.pi - self.best_fit["DZ"]
-        )
-        self.best_fit["DZ_err_high"] = np.abs(
-            self.best_fit["DZ_err_high"] / 2 / np.pi - self.best_fit["DZ"]
-        )
+        self.best_fit["DZ_err_low"] = self.best_fit["DZ_err_low"] * self.best_fit.DZ
+        self.best_fit["DZ_err_high"] = self.best_fit["DZ_err_high"] * self.best_fit.DZ
+        
         self.best_fit["DXY"] = np.abs(self.best_fit["DXY"] / 2 / np.pi)
-        self.best_fit["DXY_err_low"] = np.abs(
-            self.best_fit["DXY_err_low"] / 2 / np.pi - self.best_fit["DXY"]
-        )
-        self.best_fit["DXY_err_high"] = np.abs(
-            self.best_fit["DXY_err_high"] / 2 / np.pi - self.best_fit["DXY"]
-        )
-        self.best_fit["DZ_phys"] = self.best_fit["DZ"] * self.best_fit.Wavelength_cm
-        self.best_fit["DZ_err_low_phys"] = np.abs(
-            self.best_fit["DZ_err_low"] * self.best_fit.Wavelength_cm
-            - self.best_fit["DZ_phys"]
-        )
-        self.best_fit["DZ_err_high_phys"] = np.abs(
-            self.best_fit["DZ_err_high"] * self.best_fit.Wavelength_cm
-            - self.best_fit["DZ_phys"]
-        )
-        self.best_fit["DXY_phys"] = self.best_fit["DXY"] * self.best_fit.Wavelength_cm
-        self.best_fit["DXY_err_low_phys"] = np.abs(
-            self.best_fit["DXY_err_low"] * self.best_fit.Wavelength_cm
-            - self.best_fit["DXY_phys"]
-        )
-        self.best_fit["DXY_err_high_phys"] = np.abs(
-            self.best_fit["DXY_err_high"] * self.best_fit.Wavelength_cm
-            - self.best_fit["DXY_phys"]
-        )
+        self.best_fit["DXY_err_low"] = self.best_fit["DXY_err_low"] * self.best_fit.DXY
+        self.best_fit["DXY_err_high"] = self.best_fit["DZ_err_high"] * self.best_fit.DXY
+        
+        params = [ "DZ", "DZ_err_low", "DZ_err_high", "DXY", "DXY_err_low", "DXY_err_high"]
+        params_phys = ["DZ_phys", "DZ_err_low_phys", "DZ_err_high_phys", "DXY_phys", "DXY_err_low_phys", "DXY_err_high_phys"]
+        
+        self.best_fit[params_phys] = self.best_fit[params].apply(lambda val: val * self.best_fit.Wavelength_cm)
+        
         self.best_fit["PHI_0"] = np.degrees(self.best_fit["PHI_0"])
         self.best_fit["PHI_0_err_low"] = np.degrees(self.best_fit["PHI_0_err_low"])
         self.best_fit["PHI_0_err_high"] = np.degrees(self.best_fit["PHI_0_err_high"])
         self.best_fit["Wavelength_cm"] = np.round(self.best_fit["Wavelength_cm"], 2)
         return self
 
-    def save(self, path="../data/processed"):
+    def save(self, suffix=None, path="../data/processed"):
         """
         Save the best fit, predicted, and data as CSV files.
 
@@ -560,13 +563,13 @@ class PhaseCenter:
         Returns:
             self: The current instance of the class.
         """
-        timestamp = pd.Timestamp.now().strftime("%Y_%_m%d_%H_%M_%S")
-        self.best_fit.to_csv(f"{path}/best_fit_{timestamp}.csv", index=False)
-        self.predicted.to_csv(f"{path}/predicted_{timestamp}.csv", index=False)
+        timestamp = pd.Timestamp.now().strftime("%d_%M_%Y_%H_%M_%S")
+        self.best_fit.to_csv(f"{path}/best_fit_{timestamp}_{suffix}.csv", index=False)
+        self.predicted.to_csv(f"{path}/predicted_{timestamp}_{suffix}.csv", index=False)
         self.data.to_csv(f"{path}/data_{timestamp}.csv", index=False)
         return self
 
-    def plot_phase_center(self, ax=None):
+    def plot_phase_center(self, ax=None, size=(8, 4)):
         """
         Plot the phase center data.
 
@@ -578,10 +581,12 @@ class PhaseCenter:
 
         """
         if ax is None:
-            fig, ax = plt.subplots(nrows=2, ncols=2, figsize=(8, 4))
-        for name, data in self.best_fit.groupby(["DATASET", "WEIGHT", "SMOOTH"]):
-            yerr = data[["DZ_err_low", "DZ_err_high"]].T.values
-            yerr_phys = data[["DZ_err_low_phys", "DZ_err_high_phys"]].T.values
+            fig, ax = plt.subplots(nrows=2, ncols=2, figsize=size)
+        for name, data in self.best_fit.groupby(["DATASET", "WEIGHT", "SMOOTH", "METHOD"]):
+            yerr = data[["DZ_err_low", "DZ_err_high"]].apply(lambda val: np.abs(data.DZ - val)).T.values
+            yerr_phys = data[["DZ_err_low_phys", "DZ_err_high_phys"]].apply(lambda val: np.abs(data.DZ_phys - val)).T.values
+            yerr_XY = data[["DXY_err_low", "DXY_err_high"]].apply(lambda val: np.abs(data.DXY - val)).T.values
+            yerr_XY_phys = data[["DXY_err_low_phys", "DXY_err_high_phys"]].apply(lambda val: np.abs(data.DXY_phys - val)).T.values
             ax[0, 0].errorbar(
                 1000 * data.FREQ,
                 data.DZ,
@@ -589,7 +594,7 @@ class PhaseCenter:
                 color=get_color(name),
                 linewidth=get_linewidth(name),
                 linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
             )
             ax[0, 1].errorbar(
                 1000 * data.FREQ,
@@ -598,7 +603,7 @@ class PhaseCenter:
                 color=get_color(name),
                 linewidth=get_linewidth(name),
                 linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
             )
             ax[0, 0].set_xlabel("Frequency (MHz)")
             ax[0, 0].set_ylabel(r"Phase Center $\Delta_z$ ($\lambda$)")
@@ -609,20 +614,20 @@ class PhaseCenter:
             ax[1, 0].errorbar(
                 1000 * data.FREQ,
                 data.DXY,
-                yerr=yerr,
+                yerr=yerr_XY,
                 color=get_color(name),
                 linewidth=get_linewidth(name),
                 linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
             )
             ax[1, 1].errorbar(
                 1000 * data.FREQ,
                 data.DXY_phys,
-                yerr=yerr_phys,
+                yerr=yerr_XY_phys,
                 color=get_color(name),
                 linewidth=get_linewidth(name),
                 linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
             )
             ax[1, 0].set_xlabel("Frequency (MHz)")
             ax[1, 0].set_ylabel(r"Phase Center $\Delta_{XY}$ ($\lambda$)")
@@ -632,7 +637,7 @@ class PhaseCenter:
 
         return ax
 
-    def plot_statistics(self, ax=None):
+    def plot_statistics(self, ax=None, size=(8, 6)):
         """
         Plots various statistics using the provided axes.
 
@@ -644,16 +649,17 @@ class PhaseCenter:
             matplotlib.axes.Axes: The axes object containing the plotted statistics.
         """
         if ax is None:
-            fig, ax = plt.subplots(nrows=3, ncols=2, figsize=(8, 2 * 3))
+            fig, ax = plt.subplots(nrows=3, ncols=2, figsize=size)
 
-        for name, data in self.best_fit.groupby(["DATASET", "WEIGHT", "SMOOTH"]):
+        for name, data in self.best_fit.groupby(["DATASET", "WEIGHT", "SMOOTH", "METHOD"]):
+            
             ax[0, 0].plot(
                 1000 * data.FREQ,
                 data.R2,
                 color=get_color(name),
                 linewidth=get_linewidth(name),
                 linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
             )
             ax[0, 1].plot(
                 1000 * data.FREQ,
@@ -661,20 +667,17 @@ class PhaseCenter:
                 color=get_color(name),
                 linewidth=get_linewidth(name),
                 linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
             )
             ax[1, 0].plot(
                 1000 * data.FREQ,
                 data.KS,
-                color=get_color(name),
-                linewidth=get_linewidth(name),
-                linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
             )
             ax[1, 1].plot(
                 1000 * data.FREQ,
                 data.KS_res,
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
             )
             ax[0, 0].set_xlabel("Frequency (MHz)")
             ax[0, 0].set_ylabel(r"Coefficient of determination $R^2$")
@@ -692,13 +695,24 @@ class PhaseCenter:
                 color=get_color(name),
                 linewidth=get_linewidth(name),
                 linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
             )
+        lines_labels = [ax.get_legend_handles_labels() for ax in fig.axes]
+        lines, labels = [sum(lol, []) for lol in zip(*lines_labels)]
 
-            ax[2, 0].legend(loc="lower right", bbox_to_anchor=(1.8, -0.4), ncol=2)
+        # grab unique labels
+        unique_labels = set(labels)
+
+        # assign labels and legends in dict
+        legend_dict = dict(zip(labels, lines))
+
+        # query dict based on unique labels
+        unique_lines = [legend_dict[x] for x in unique_labels]
+
+        ax[2, 0].legend(unique_lines, unique_labels, loc="lower right", bbox_to_anchor=(1.8, -0.4), ncol=2)
         return ax
 
-    def plot_phases(self, freqs=None, ncols=3, ax=None):
+    def plot_phases(self, freqs=None, ncols=3, ax=None, size=None):
         """
         Plot the phases of the predicted data.
 
@@ -714,59 +728,63 @@ class PhaseCenter:
             freqs = self.best_fit.FREQ.unique()
         ncols = 4
         nrows = int(np.ceil(2 * len(freqs) / ncols))
+        if size is None:
+            size = (8, 2 * nrows)
         if ax is None:
             fig, ax = plt.subplots(
                 nrows=nrows,
                 ncols=ncols,
                 sharex=True,
                 sharey=True,
-                figsize=(8, 2 * nrows),
+                figsize=size,
                 gridspec_kw={"hspace": 0, "wspace": 0},
             )
         jj = 0
         kk = 0
-        for pol, dataset in self.predicted.groupby(["DATASET"]):
-            for name_, dataset_ in dataset.groupby(["WEIGHT", "SMOOTH"]):
-                for ii, freq in enumerate(freqs):
-                    kk = ii + jj
-                    name = (pol[0], name_[0], name_[1])
-                    data = dataset_[dataset_.FREQ == freq].sort_values("ANGLE").copy()
-                    ax[kk // ncols, kk % ncols].plot(
-                        np.degrees(data.ANGLE),
-                        np.degrees(data.PHASE),
-                        color="black",
-                        linewidth=1.5,
-                        linestyle=":",
-                        alpha=0.5,
-                        label=f"Measured",
-                    )
-                    phase_smooth = self.data.query(
-                        f"FREQ == {freq} and DATASET == '{pol[0]}' and ANGLE <= {data.ANGLE.max()} and ANGLE >= {-data.ANGLE.max()}"
-                    )[["ANGLE", "PHASE_SM"]]
-                    ax[kk // ncols, kk % ncols].plot(
-                        np.degrees(phase_smooth.ANGLE),
-                        np.degrees(phase_smooth.PHASE_SM),
-                        color="violet",
-                        linewidth=1.5,
-                        alpha=0.5,
-                        label=f"Smoothed - Savitsky-Golay (Loess)",
-                    )
-                    ax[kk // ncols, kk % ncols].plot(
-                        np.degrees(data.ANGLE),
-                        np.degrees(data.PREDICTED),
-                        color=get_color(name),
-                        linewidth=get_linewidth(name),
-                        linestyle=get_linestyle(name),
-                        label=f"Predicted - Dataset: {pol[0]}, Weights: {name[1]}, Smooth: {name[2]}",
-                        alpha=0.3,
-                    )
-                    ax[kk // ncols, kk % ncols].set_title(
-                        f"Frequency: {freq * 1000:.0f} MHz - {pol[0]}",
-                    )
-                    ax[kk // ncols, kk % ncols].grid(
-                        color="gray", linestyle="--", linewidth=0.2
-                    )
+        for method, _dataset in self.predicted.groupby(["METHOD"]):
+            for pol, dataset in _dataset.groupby(["DATASET"]):
+                for name_, dataset_ in dataset.groupby(["WEIGHT", "SMOOTH"]):
+                    for ii, freq in enumerate(freqs):
+                        kk = ii + jj
+                        name = (method[0], pol[0], name_[0], name_[1])
+                        data = dataset_[dataset_.FREQ == freq].sort_values("ANGLE").copy()
+                        ax[kk // ncols, kk % ncols].plot(
+                            np.degrees(data.ANGLE),
+                            np.degrees(data.PHASE),
+                            color="black",
+                            linewidth=1.5,
+                            linestyle=":",
+                            alpha=0.5,
+                            label=f"Measured",
+                        )
+                        phase_smooth = self.data.query(
+                            f"FREQ == {freq} and DATASET == '{pol[0]}' and ANGLE <= {data.ANGLE.max()} and ANGLE >= {-data.ANGLE.max()}"
+                        )[["ANGLE", "PHASE_SM"]]
+                        ax[kk // ncols, kk % ncols].plot(
+                            np.degrees(phase_smooth.ANGLE),
+                            np.degrees(phase_smooth.PHASE_SM),
+                            color="violet",
+                            linewidth=1.5,
+                            alpha=0.5,
+                            label=f"Smoothed - Savitsky-Golay (Loess)",
+                        )
+                        ax[kk // ncols, kk % ncols].plot(
+                            np.degrees(data.ANGLE),
+                            np.degrees(data.PREDICTED),
+                            color=get_color(name),
+                            linewidth=get_linewidth(name),
+                            linestyle=get_linestyle(name),
+                            label=f"Predicted - Dataset: {pol[0]}, Weights: {name[1]}, Smooth: {name[2]}",
+                            alpha=0.3,
+                        )
+                        ax[kk // ncols, kk % ncols].set_title(
+                            f"Frequency: {freq * 1000:.0f} MHz - {pol[0]}",
+                        )
+                        ax[kk // ncols, kk % ncols].grid(
+                            color="gray", linestyle="--", linewidth=0.2
+                        )
 
+                jj = kk + 1
             jj = kk + 1
 
         ax[0, 0].set_xlabel(
@@ -845,11 +863,11 @@ class PhaseCenter:
         ]
         alpha = 0.5
         dataset = self.predicted
-        for name_, dataset_ in dataset.groupby(["DATASET", "WEIGHT", "SMOOTH"]):
+        for name_, dataset_ in dataset.groupby(["METHOD", "DATASET", "WEIGHT", "SMOOTH"]):
             for ii, freq in enumerate(freqs):
                 data = dataset_[dataset_.FREQ == freq].sort_values("ANGLE").copy()
                 ll = list(
-                    dataset.groupby(["DATASET", "WEIGHT", "SMOOTH"]).groups.keys()
+                    dataset.groupby(["METHOD", "DATASET", "WEIGHT", "SMOOTH"]).groups.keys()
                 ).index(name_)
                 p1 = sm.ProbPlot(data.PHASE)
                 p2 = sm.ProbPlot(data.PREDICTED)
@@ -927,13 +945,13 @@ class PhaseCenter:
         kk = 0
         jj = 0
         for pol, dataset in self.predicted.groupby(["DATASET"]):
-            for name_, dataset_ in dataset.groupby(["DATASET", "WEIGHT", "SMOOTH"]):
+            for name_, dataset_ in dataset.groupby(["WEIGHT", "SMOOTH", "METHOD"]):
                 for ii, freq in enumerate(freqs):
                     kk = ii + jj
                     ll = list(
-                        dataset.groupby(["DATASET", "WEIGHT", "SMOOTH"]).groups.keys()
+                        dataset.groupby(["WEIGHT", "SMOOTH", "METHOD"]).groups.keys()
                     ).index(name_)
-                    name = (pol[0], name_[0], name_[1])
+                    name = (pol[0], name_[0], name_[1], name_[2])
                     data = dataset_[dataset_.FREQ == freq]
                     res = data.apply(
                         lambda data: data.PHASE - data.PREDICTED, axis=1
@@ -1017,7 +1035,7 @@ class PhaseCenter:
         file = max(files, key=lambda file: file.stat().st_ctime)
         return file
 
-    def load(self, path, files=None):
+    def load(self, path, mask=None):
         """
         Load the data from CSV files.
 
@@ -1029,9 +1047,13 @@ class PhaseCenter:
             self: The PhaseCenter object with the loaded data.
 
         """
-        if files is None:
-            masks = ["best_fit*.csv", "predicted*.csv", "data*.csv"]
-            files = [PhaseCenter.get_recent_file(path, mask) for mask in masks]
+        masks = ["best_fit", "predicted", "data"]
+        if mask is None:
+            _mask = [__mask + "*.csv" for __mask in masks]
+            files = [PhaseCenter.get_recent_file(path, mask) for mask in _mask]
+        else:
+            _mask = [__mask + f"*{mask}*.csv" for __mask in masks]
+            files = [PhaseCenter.get_recent_file(path, mask) for mask in _mask]
         self.best_fit = pd.read_csv(files[0])
         self.predicted = pd.read_csv(files[1])
         self.data = pd.read_csv(files[2])
