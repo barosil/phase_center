@@ -1,78 +1,56 @@
-import numpy as np
-import pandas as pd
-from scipy.constants import c
-import scipy as sp
-import matplotlib.pyplot as plt
-import statsmodels.api as sm
-from pathlib import Path
-from typing import Union
-import numpy as np
-import pandas as pd
-from scipy.constants import c
-import scipy as sp
-from pathlib import Path
-from typing import Union, Optional, Tuple
-import matplotlib.pyplot as plt
-import statsmodels.api as sm
+from __future__ import annotations
 
+import functools
+import itertools
+import operator
+from pathlib import Path
+from typing import Any, Callable, Generator
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import scipy as sp
+import statsmodels.api as sm
+from scipy.constants import c
 
 DATASET = [
     "beampattern_horn01_Polarização_Horizontal_Copolar.csv",
     "beampattern_horn01_Polarização_Vertical_Copolar.csv",
-    # "beampattern_horn01_Polarização_Horizontal_Cruzada.csv",
-    # "beampattern_horn01_Polarização_Vertical_Cruzada.csv",
+#    "beampattern_horn01_Polarização_Horizontal_Cruzada.csv",
+#    "beampattern_horn01_Polarização_Vertical_Cruzada.csv",
 ]
-
-
-def get_color(name: str) -> str:
-    pol = name[0]
-    if pol == "Horizontal_Copolar":
-        return "blue"
-    else:
-        return "red"
-
-
-def get_linewidth(name: str) -> float:
-    weight = name[1]
-    if weight == "Amplitude":
-        return 1.0
-    else:
-        return 0.5
-
-
-def get_linestyle(name: str) -> str:
-    smooth = name[2]
-    if smooth:
-        return "--"
-    else:
-        return "-"
 
 
 class PhaseCenter:
     def __init__(
         self,
-        bootstrap: bool = True,
-        smooth: bool = True,
         dataset: list[str] = DATASET,
         theta_cut: int = 20,
         taper: int = -10,
         D0: float = 2.35,
         path: str = "../data/raw/",
-    ):
+        sigma_theta: float | None = None,
+        sigma_phase: float | None = None,
+    ) -> None:
+        self.dataset = dataset
+        self._D0 = D0
         self.path = path
         self._dataset = dataset
-        self.sigma_theta = np.radians(0.1)
-        self.sigma_phase = np.radians(1)
+        self.sigma_theta = sigma_theta
+        self.sigma_phase = sigma_phase
         self.theta_cut = theta_cut
         self.taper = taper
-        self.bootstrap = bootstrap
-        self.smooth = smooth
-        self.guess = None
-        self.data = None
+        self.data = self.load_data()
         self.params = pd.DataFrame()
         self.best_fit = None
-        self._D0 = D0
-        self.GROUPS = ["DATASET", "WEIGHT", "SMOOTH", "FREQ", "METHOD"]
+        self.GROUPS = [
+            "DATASET",
+            "WEIGHT",
+            "SMOOTH",
+            "BOOTSTRAP",
+            "METHOD",
+            "FREQ",
+        ]
 
     @property
     def D0(self) -> float:
@@ -90,6 +68,24 @@ class PhaseCenter:
     def dataset(self, dataset: list[str]) -> None:
         self._dataset = dataset
 
+    @staticmethod
+    def _wavelength_cm(freq: float) -> float:
+        return 100 * c / (freq * 1e9)
+
+    @staticmethod
+    def _DZ_lam(DZ: float, D0: float, freq: float) -> float:
+        return 100 * D0 / PhaseCenter._wavelength_cm(freq) - DZ / 2 / np.pi
+
+    @staticmethod
+    def _DZ_err_lam(DZ: float, DZ_err: float, freq: float, D0: float) -> float:
+        return (DZ_err / DZ) * PhaseCenter._DZ_lam(DZ, D0, freq)
+
+    @staticmethod
+    def _DZ_phys(DZ: float, D0: float, freq: float) -> float:
+        return PhaseCenter._DZ_lam(DZ, D0, freq) * PhaseCenter._wavelength_cm(
+            freq,
+        )
+
     def _normalize_AMP(self, data: pd.DataFrame) -> pd.DataFrame:
         data.AMPLITUDE = data.AMPLITUDE - data.AMPLITUDE.max()
         Theta_0 = data.ANGLE[data.AMPLITUDE.idxmax()]
@@ -97,7 +93,7 @@ class PhaseCenter:
         return data
 
     def _normalize_PHASE(self, data: pd.DataFrame) -> pd.DataFrame:
-        PHI_0 = data[data.ANGLE == 0]["PHASE"].values[0]
+        PHI_0 = data[data.ANGLE == 0]["PHASE"].to_numpy()[0]
         data["PHASE"] = np.unwrap(data.PHASE - PHI_0)
         return data
 
@@ -133,14 +129,16 @@ class PhaseCenter:
             .reset_index(drop=True)
             .groupby("FREQ")[["ANGLE", "PHASE", "AMPLITUDE"]]
             .apply(
-                lambda data: data.assign(FWHM=lambda data: self._get_taper_angle(data))
+                lambda data: data.assign(
+                    FWHM=lambda data: self._get_taper_angle(data),
+                ),
             )
             .reset_index()
             .groupby("FREQ")[["FREQ", "ANGLE", "PHASE", "AMPLITUDE", "FWHM"]]
             .apply(
                 lambda data: data.assign(
-                    THETA_CUT=lambda data: self._get_angle_phase(data)
-                )
+                    THETA_CUT=lambda data: self._get_angle_phase(data),
+                ),
             )
             .reset_index(drop=True)
             .groupby("FREQ")[
@@ -148,23 +146,87 @@ class PhaseCenter:
             ]
             .apply(
                 lambda data: data.assign(
-                    THETA_MAX=lambda data: np.min([data.FWHM, data.THETA_CUT])
-                )
+                    THETA_MAX=lambda data: np.min([data.FWHM, data.THETA_CUT]),
+                ),
             )
             .query("ANGLE >= -THETA_MAX & ANGLE <= THETA_MAX")
             .reset_index(drop=True)
         )
         data_["DATASET"] = dataset
-        if self.smooth:
-            data_.groupby(["DATASET", "FREQ"])[data_.columns].apply(
-                lambda data: data.assign(PHASE_SM=self._smooth_func(data.PHASE))
-            ).reset_index(drop=True)
+
+        data_ = (
+            data_.groupby(["DATASET", "FREQ"])[data_.columns]
+            .apply(
+                lambda data: data.assign(
+                    PHASE_SM=self._smooth_func(data.PHASE),
+                ),
+            )
+            .reset_index(drop=True)
+        )
+
+        data_["s_AMP"] = self._sigma_Amp(data_.AMPLITUDE)
+        data_["s_Uniform"] = self._sigma_Uniform(data_.AMPLITUDE)
+
         return data_
 
-    def _load_data(self) -> "PhaseCenter":
+    def load_data(self) -> PhaseCenter:
         filenames = [self.path + file for file in self.dataset]
-        data = pd.concat([self._load_dataset(filename) for filename in filenames])
-        self.data = data
+        return pd.concat(
+            [self._load_dataset(filename) for filename in filenames],
+        )
+
+    @staticmethod
+    def get_recent_file(path: str, mask: str) -> Path:
+        files = list(Path(path).glob(mask))
+        if not files:
+            msg = (
+                f"No files matching the mask '{mask}' found in the directory"
+                "'{path}'."
+            )
+            raise ValueError(msg)
+        return max(files, key=lambda file: file.stat().st_ctime)
+
+    def load(self, path: str, mask: str | None = None) -> PhaseCenter:
+        """Load the data from CSV files.
+
+        Args:
+        ----
+            path (str): The path to the directory containing the CSV files.
+            mask (str, optional): The mask to filter the CSV files. Defaults to
+            None.
+
+        Returns:
+        -------
+            PhaseCenter: The PhaseCenter object with loaded data.
+
+        """
+        masks = ["best_fit", "predicted", "data"]
+        if mask is not None:
+            _mask = [__mask + "*.csv" for __mask in masks]
+            files = [PhaseCenter.get_recent_file(path, mask) for mask in _mask]
+        else:
+            _mask = [__mask + f"*{mask}*.csv" for __mask in masks]
+            files = [PhaseCenter.get_recent_file(path, mask) for mask in _mask]
+        self.best_fit = pd.read_csv(files[0])
+        self.predicted = pd.read_csv(files[1])
+        self.data = pd.read_csv(files[2])
+        return self
+
+    def save(
+        self,
+        suffix: str | None = None,
+        path: str = "../data/processed",
+    ) -> PhaseCenter:
+        timestamp = pd.Timestamp.now().strftime("%d_%M_%Y_%H_%M_%S")
+        self.best_fit.to_csv(
+            f"{path}/best_fit_{timestamp}_{suffix}.csv",
+            index=False,
+        )
+        self.predicted.to_csv(
+            f"{path}/predicted_{timestamp}_{suffix}.csv",
+            index=False,
+        )
+        self.data.to_csv(f"{path}/data_{timestamp}_{suffix}.csv", index=False)
         return self
 
     def _smooth_func(self, phase: np.ndarray) -> np.ndarray:
@@ -172,229 +234,306 @@ class PhaseCenter:
 
     def _smooth_phases(self, data: pd.DataFrame) -> np.ndarray:
         phases = []
-        for gr, group in data.groupby(["DATASET", "FREQ"]):
+        for _, group in data.groupby(["DATASET", "FREQ"]):
             phases.append(self._smooth_func(group.PHASE))
-        phases = np.concatenate(phases)
-        return phases
+        return np.concatenate(phases)
 
-    def fit_phase(
+    def _fit_phase(
         self,
-        model: Union[None, callable] = None,
-        bootstrap: Union[None, bool] = None,
-        smooth: Union[None, bool] = None,
-        sigma_func: Union[None, callable] = None,
-    ) -> Union[pd.DataFrame, None]:
-        if bootstrap is None:
-            bootstrap = self.bootstrap
-        if smooth is None:
-            smooth = self.smooth
-        if sigma_func is None:
-            sigma_func = PhaseCenter._sigma_Amp
-        if model is None:
-            model = PhaseCenter.model
-        cols_orig = ["DATASET", "FREQ", 0, 1, 2, 3, 4, 5]
-        par_names = [
-            "DATASET",
-            "FREQ",
-            "DZ",
-            "PHI_0",
-            "DXY",
-            "DZ_err",
-            "PHI_0_err",
-            "DXY_err",
-        ]
-        if smooth:
-            phase_str = "PHASE_SM"
-            if phase_str not in self.data.columns:
-                self.data = (
-                    self.data.groupby(["DATASET", "FREQ"])[self.data.columns]
-                    .apply(
-                        lambda data: data.assign(PHASE_SM=self._smooth_func(data.PHASE))
-                    )
-                    .reset_index(drop=True)
-                )
-        else:
-            phase_str = "PHASE"
-
-        while True:
-            fit = (
-                self.data.groupby(["DATASET", "FREQ"])[
-                    ["ANGLE", phase_str, "AMPLITUDE"]
-                ]
-                .apply(
-                    lambda data: pd.Series(
-                        self._fit_phase_center(
-                            data,
-                            model,
-                            sigma_func,
-                            phase_str=phase_str,
-                            bootstrap=bootstrap,
-                            group=data.name,
-                        )
-                    )
-                )
-                .reset_index()
-                .rename(columns=dict(zip(cols_orig, par_names)))
+        model: callable,
+        sigma_func: callable,
+        phase_str: str,
+        bootstrap: None | bool,
+        cols_orig: list[str],
+        par_names: list[str],
+    ) -> pd.DataFrame:
+        return (
+            self.data.groupby(["DATASET", "FREQ"])[
+                ["ANGLE", phase_str, "AMPLITUDE"]
+            ]
+            .apply(
+                lambda data: pd.Series(
+                    self._fit_phase_center(
+                        data,
+                        model,
+                        sigma_func,
+                        phase_str=phase_str,
+                        bootstrap=bootstrap,
+                        group=data.name,
+                    ),
+                ),
             )
-            fit["SMOOTH"] = smooth
-            weight = "Amplitude" if sigma_func == PhaseCenter._sigma_Amp else "Uniform"
-            fit["WEIGHT"] = weight
-            if self.params.empty:
-                fit["SAMPLE"] = 1
-            else:
-                groups = self.params.groupby(["WEIGHT", "SMOOTH"]).groups.keys()
-                if (weight, smooth) in groups:
-                    fit["SAMPLE"] = (
-                        self.params[
-                            (self.params.WEIGHT == weight)
-                            & (self.params.SMOOTH == smooth)
-                        ].SAMPLE.max()
-                        + 1
-                    )
-                else:
-                    fit["SAMPLE"] = 1
-            if bootstrap:
-                yield fit
-            else:
-                return fit
-            
-            
-    def set_guess(self):
-        self.guess = next(self.fit_phase())
+            .reset_index()
+            .rename(columns=dict(zip(cols_orig, par_names)))
+        )
+
+    def set_guess(self) -> PhaseCenter:
+        self.guess = next(self._fit_phase())
         return self
 
-    def _dz_phys(self, data, D0=2.35):
-        data["DZ_phys"] = 100 * (D0 - data["DZ"] / PhaseCenter._k0(data["FREQ"]))
-        return data
-
-    def _wavelength_cm(self, data):
-        data["WAVELENGTH"] = 100 * c / (data["FREQ"] * 1e9)
-        return data
-
+    @staticmethod
     def _wrap_angle(theta: np.ndarray) -> np.ndarray:
-        result = np.arctan2(np.sin(theta), np.cos(theta))
-        return result
+        return np.arctan2(np.sin(theta), np.cos(theta))
 
+    @staticmethod
     def _k0(freq: float) -> float:
-        k0 = 2 * np.pi * freq * 1e9 / c
-        return k0
+        return 2 * np.pi * freq * 1e9 / c
 
-    def _sigma_uniform(data) -> np.ndarray:
+    @staticmethod
+    def _sigma_Uniform(data: np.ndarray) -> np.ndarray:
         return np.ones(data.size)
 
-    def _sigma_Amp(data) -> np.ndarray:
+    @staticmethod
+    def _sigma_Amp(data: np.ndarray) -> np.ndarray:
         return 1 / (10 ** (data / 10))
 
-    def model(theta, DZ, PHI0, DXY: float) -> np.ndarray:
-        Phi = DXY * np.sin(theta) + DZ * np.cos(theta) + PHI0
-        return Phi
-    
-    def _fit_odr(X, y, model, sx, sy, guess):
+    @staticmethod
+    def model(
+        theta: np.ndarray, DZ: float, PHI0: float, DXY: float
+    ) -> np.ndarray:
+        return DXY * np.sin(theta) + DZ * np.cos(theta) + PHI0
+
+    @staticmethod
+    def _fit_ols(
+        data: np.ndarray,
+        model: callable,
+        guess: tuple[float, float, float],
+        predict: bool = False,  # noqa: FBT002, FBT001
+    ) -> tuple[float, float, float]:
+        popt, pcov = sp.optimize.curve_fit(
+            model,
+            data[:, 0],
+            data[:, 1],
+            p0=guess,
+            sigma=data[:, 2],
+            maxfev=10000,
+        )
+        params = [*popt, *np.sqrt(np.diag(pcov))]
+        if predict:
+            y_pred = model(data[:, 0], *popt)
+            params = [*params, *y_pred]
+        return np.asarray(params)
+
+    @staticmethod
+    def _fit_odr(
+        data: np.ndarray,
+        model: callable,
+        guess: tuple[float, float, float],
+        predict: bool = False,  # noqa: FBT002, FBT001
+    ) -> tuple[float, float, float]:
         model_odr = sp.odr.Model(model)
-        DATA = sp.odr.RealData(X, y, sx=sx, sy=sy)
+        DATA = sp.odr.RealData(
+            data[:, 0],
+            data[:, 1],
+            sx=data[:, 2],
+            sy=data[:, 3],
+        )
         result = sp.odr.ODR(DATA, model_odr, beta0=guess).run()
-        param = (result.beta[0], result.beta[1], result.beta[2])
-        perr = (result.sd_beta[0], result.sd_beta[1], result.sd_beta[2])
-        y_pred = result.y
-        return param, perr, y_pred
-        
-        
-    def _fit_phase_center(
-        self, data, model, sigma_func, phase_str="PHASE", bootstrap=False, group=None, errors=False
-    ):
-        if bootstrap:
-            idx = np.random.choice(data.index, size=len(data), replace=True)
-            data = data.loc[idx]
-        if self.guess is None:
-            guess = [0, 0, 0]
-        else:
-            guess = self.guess[
-                (self.guess.DATASET == group[0]) & (self.guess.FREQ == group[1])
-            ][["DZ", "PHI_0", "DXY"]].values[0]
-        if errors:
-            def _model(params, theta):
-                return model(theta, *params)
-            param, perr, _ = PhaseCenter._fit_odr(data.ANGLE, data[phase_str], _model, self.sigma_theta, self.sigma_phase, guess)
-            model_odr = sp.odr.Model(_model)
-            DATA = sp.odr.RealData(data.ANGLE, data[phase_str], sx=self.sigma_theta, sy=self.sigma_phase)
-            result = sp.odr.ODR(DATA, model_odr, beta0=guess).run()
-            param = (result.beta[0], result.beta[1], result.beta[2])
-            perr = (result.sd_beta[0], result.sd_beta[1], result.sd_beta[2])
-        else:
-            sigma = sigma_func(data.AMPLITUDE)
-            popt, pcov = sp.optimize.curve_fit(
-                model, data.ANGLE, data[phase_str], p0=guess, sigma=sigma, maxfev=10000
+        params = np.asarray(list(result.beta))
+        perr = np.asarray(list(result.sd_beta))
+        params = [*params, *perr]
+        if predict:
+            y_pred = result.y
+            params = [*params, *y_pred]
+        return np.asarray(params)
+
+    @staticmethod
+    def _fit_ols_gen(
+        data: np.ndarray,
+        model: callable,
+        guess: tuple[float, float, float],
+        predict: bool = False,  # noqa: FBT002, FBT001
+    ) -> Generator[Any, Any, Any]:
+        rng = np.random.default_rng()
+        idx = rng.choice(data.shape[0], size=data.shape[0], replace=True)
+        data = data[idx]
+        result = PhaseCenter._fit_ols(data, model, guess, predict=predict)
+        yield np.asarray(result)
+
+    @staticmethod
+    def _fit_odr_gen(
+        data: np.ndarray,
+        model: callable,
+        guess: tuple[float, float, float],
+        predict: bool = False,  # noqa: FBT002, FBT001
+    ) -> Generator[Any, Any, Any]:
+        rng = np.random.default_rng()
+        idx = rng.choice(data.shape[0], size=data.shape[0], replace=True)
+        data = data[idx]
+        result = PhaseCenter._fit_odr(data, model, guess, predict=predict)
+        yield np.asarray(result)
+
+    @staticmethod
+    def _fit(
+        data: np.ndarray,
+        model: Callable,
+        guess: tuple[float, float, float],
+        n: int = 100,
+        predict: bool = False,  # noqa: FBT002, FBT001
+    ) -> np.ndarray:
+        EXPECTED_COLUMNS = 2
+
+        if data.shape[1] == EXPECTED_COLUMNS:
+            return np.asarray(
+                [
+                    next(
+                        PhaseCenter._fit_ols_gen(
+                            data,
+                            model,
+                            guess,
+                            predict=predict,
+                        ),
+                    )
+                    for x in np.arange(n)
+                ],
             )
-            param = popt
-            perr = np.sqrt(np.diag(pcov))
-        return [*param, *perr]
-
-    def run_bootstrap(self, sigma_func=None, smooth: bool = True, n: int = 100, errors=False) -> "PhaseCenter":
-        """
-        Runs the bootstrap process for estimating the phase center.
-
-        Args:
-            sigma_func: A function to calculate the sigma value. If not provided, the default sigma function will be used.
-            smooth: A boolean indicating whether to apply smoothing during the bootstrap process. Default is True.
-            n: The number of iterations for the bootstrap process. Default is 100.
-
-        Returns:
-            PhaseCenter: The updated PhaseCenter object.
-
-        """
-        if sigma_func is None:
-            sigma_func = PhaseCenter._sigma_Amp
-        for ii in range(n):
-            if self.params.empty:
-                self.params = next(self.fit_phase(sigma_func=sigma_func, smooth=smooth))
-            else:
-                self.params = pd.concat(
-                    [
-                        self.params,
-                        next(self.fit_phase(sigma_func=sigma_func, smooth=smooth)),
-                    ]
+        return np.asarray(
+            [
+                next(
+                    PhaseCenter._fit_ols_gen(
+                        data,
+                        model,
+                        guess,
+                        predict=predict,
+                    ),
                 )
-            self.params["METHOD"] = "ODR" if errors else "OLS"
-        return self
+                for x in np.arange(n)
+            ],
+        )
 
-    def _best_fit(self, data: pd.DataFrame, rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    @staticmethod
+    def _bootstrap(
+        data: np.ndarray, rng: np.random.Generator | None = None
+    ) -> None:
         if rng is None:
             rng = np.random.default_rng()
-        n_params = data.shape[1]
-        if n_params == 1:
-            _data = (data.values,)
-            res = sp.stats.bootstrap(_data, np.mean, random_state=rng)
-            values = np.asarray(
-                [
-                    data.mean()[0],
-                    res.confidence_interval[0][0] / data.mean()[0],
-                    res.confidence_interval[1][0] / data.mean()[0],
-                ]
+        n_pars = data.shape[1] // 2
+        if data.shape[0] > 1:
+            data = data[:, :n_pars]
+            res = np.apply_along_axis(
+                lambda data: sp.stats.bootstrap(
+                    data.reshape(1, -1),
+                    np.mean,
+                    random_state=rng,
+                ),
+                0,
+                data,
+            )
+            result = np.ravel(
+                np.asarray(
+                    [
+                        [
+                            np.mean(data[:, ii]),
+                            np.abs(
+                                np.mean(data[:, ii])
+                                - rr.confidence_interval[0],
+                            ),
+                            np.abs(
+                                np.mean(data[:, ii])
+                                - rr.confidence_interval[1],
+                            ),
+                        ]
+                        for ii, rr in enumerate(res)
+                    ],
+                ),
             )
         else:
-            values = np.zeros((n_params, 3))
-            for ii in range(n_params):
-                _data = (data.iloc[:, ii].values,)
-                res = sp.stats.bootstrap(_data, np.mean, random_state=rng)
-                values[ii, :] = np.asarray(
-                    [
-                        data.iloc[:, ii].mean(),
-                        res.confidence_interval[0] / data.iloc[:, ii].mean() ,
-                        res.confidence_interval[1] / data.iloc[:, ii].mean(),
-                    ]
-                )
-            values = np.ravel(values)
-        return values
+            result = np.asarray(
+                [
+                    data[0, 0],
+                    data[0, 3],
+                    data[0, 3],
+                    data[0, 1],
+                    data[0, 4],
+                    data[0, 4],
+                    data[0, 2],
+                    data[0, 5],
+                    data[0, 5],
+                ],
+            )
+        return result
 
-    def run_best_fit(self) -> "PhaseCenter":
-        """
-        Runs the best fit algorithm on the parameters and returns a PhaseCenter object.
+    @staticmethod
+    def _best_guess(
+        data: np.ndarray,
+        model: callable,
+        guess: list[float],
+        n: int,
+    ) -> np.ndarray:
+        return PhaseCenter._bootstrap(
+            PhaseCenter._fit(data, model, guess, n=n),
+        )
 
-        Returns:
-            PhaseCenter: The PhaseCenter object with the best fit results.
-        """
-        cols_orig = [*self.GROUPS, 0, 1, 2, 3, 4, 5, 6, 7, 8]
-        bv_names = [*self.GROUPS,
+    def fit_phase_center(
+        self,
+        data: pd.DataFrame,
+        model: callable,
+        n: int = 50,
+    ) -> list[float]:
+        guess = [0.10, 0.10, 0.10]
+        data = data.to_numpy()
+        params = PhaseCenter._fit(data, model, guess, n=1)
+        guess = params[0][:3]
+        params = PhaseCenter._best_guess(data, model, guess, n=n)
+        method = "OLS" if data.shape[1] == 3 else "ODR"
+        result = np.concatenate([params, [method]])
+        cols = [
+            "DZ",
+            "DZ_err_low",
+            "DZ_err_high",
+            "PHI_0",
+            "PHI_0_err_low",
+            "PHI_0_err_high",
+            "DXY",
+            "DXY_err_low",
+            "DXY_err_high",
+            "METHOD",
+        ]
+        return pd.DataFrame(result.reshape(1, -1), columns=cols)
+
+    def _best_fit(self, cols: list[str], n: int) -> pd.DataFrame:
+        result = self.data.groupby(["DATASET", "FREQ"])[
+            [
+                "ANGLE",
+                *cols,
+            ]
+        ].apply(
+            lambda data: self.fit_phase_center(
+                data,
+                PhaseCenter.model,
+                n=n,
+            ),
+        )
+        EXPECTED_COLUMNS = 2
+        result["SMOOTH"] = "Smooth" if cols[0] == "PHASE_SM" else "Raw"
+        result["WEIGHT"] = (
+            cols[1] if len(cols) == EXPECTED_COLUMNS else "Uniform"
+        )
+        result["BOOTSTRAP"] = n
+        return result
+
+    def run_best_fit(self, n: int) -> PhaseCenter:
+        weights = ["s_AMP", "s_Uniform"]
+        phases = ["PHASE", "PHASE_SM"]
+        if self.sigma_theta is not None:
+            self.data["sigma_theta"] = self.sigma_theta
+            self.data["sigma_phase"] = self.sigma_phase
+            weights.append(["sigma_theta", "sigma_phase"])
+        cols_sets = list(itertools.product(phases, weights))
+        results = []
+        for cols in cols_sets:
+            _cols = list(cols)
+            _cols = (
+                _cols if isinstance(_cols[1], str) else [_cols[0], *_cols[1]]
+            )
+            result_1 = self._best_fit(_cols, 1)
+            result_n = self._best_fit(_cols, n)
+            result = pd.concat([result_1, result_n])
+            results.append(result)
+        self.best_fit = pd.concat(results).reset_index()
+        cols = [col for col in self.best_fit.columns if "level" not in col]
+        self.best_fit = self.best_fit[cols]
+        float_cols = [
             "DZ",
             "DZ_err_low",
             "DZ_err_high",
@@ -405,79 +544,59 @@ class PhaseCenter:
             "DXY_err_low",
             "DXY_err_high",
         ]
-        best_fit = (
-            self.params.groupby(self.GROUPS)[
-                ["DZ", "PHI_0", "DXY"]
-            ]
-            .apply(lambda data: pd.Series(self._best_fit(data)))
-            .reset_index()
-            .rename(columns=dict(zip(cols_orig, bv_names)))
-        )
-        self.best_fit = best_fit
+        self.best_fit[float_cols] = self.best_fit[float_cols].astype(float)
         return self
 
-    def _predict(self, params: pd.DataFrame, group: Tuple) -> np.ndarray:
-        angles = self.data.query("DATASET == @group[0] & FREQ == @group[-1]")[
-            "ANGLE"
-        ].values
-        guess = params.values[0]
-        result = PhaseCenter.model(angles, *guess)
-
-        return result
-
-    def predict(self) -> "PhaseCenter":
-        """
-        Predicts the phase center based on the best fit parameters.
-
-        Returns:
-            PhaseCenter: The PhaseCenter object with the predicted phase center values.
-        """
-        params = self.best_fit.groupby(self.GROUPS)[
-            ["DZ", "PHI_0", "DXY"]
-        ]
+    def predict(self) -> np.ndarray:
         results = []
-        for group, param in params:
-            angles = self.data.query("DATASET == @group[0] & FREQ == @group[-2]")[
-                "ANGLE"
-            ].values
-            phases = self.data.query("DATASET == @group[0] & FREQ == @group[-2]")[
-                "PHASE"
-            ].values
-            guess = param.values[0]
-            if group[-1] == "ODR":
-                def _model(params, theta):
-                    return PhaseCenter.model(theta, *params)
-                _, _, predicted = PhaseCenter._fit_odr(angles, phases, _model, self.sigma_theta, self.sigma_phase, guess)
-                
-            else:
-                predicted = PhaseCenter.model(angles, *guess)
+        data = self.data.copy()
+        for name, group in self.best_fit.groupby(
+            ["DATASET", "WEIGHT", "SMOOTH", "METHOD", "BOOTSTRAP", "FREQ"],
+        ):
+            guess = group[["DZ", "PHI_0", "DXY"]].to_numpy()[0].astype(float)
+            data = self.data.query(
+                "DATASET == @name[0] & FREQ == @name[-1]",
+            )
+            weight = (
+                [name[1]]
+                if name[1] != "Uniform"
+                else ["sigma_theta", "sigma_phase"]
+            )
+            phase = ["PHASE_SM"] if name[2] == "Smooth" else ["PHASE"]
+            cols = ["ANGLE", *phase, *weight]
+            data = data[cols].copy().to_numpy()
+            predicted = PhaseCenter.model(data[:, 0], *guess)
+
             result = pd.DataFrame(
                 {
-                    "DATASET": group[0],
-                    "WEIGHT": group[1],
-                    "SMOOTH": group[2],
-                    "FREQ": group[3],
-                    "METHOD": group[4],
-                    "ANGLE": angles,
-                    "PHASE": phases,
+                    "ANGLE": data[:, 0],
+                    "PHASE": data[:, 1],
                     "PREDICTED": predicted,
-                }
+                },
             )
+            result["DATASET"] = name[0]
+            result["WEIGHT"] = name[1]
+            result["SMOOTH"] = name[2]
+            result["METHOD"] = name[3]
+            result["BOOTSTRAP"] = name[4]
+            result["FREQ"] = name[5]
+            result["RESIDUALS"] = result.PHASE - result.PREDICTED
             results.append(result)
+
         self.predicted = pd.concat(results)
         return self
 
+    @staticmethod
     def score_R2(data: pd.DataFrame) -> float:
         return 1 - np.sum((data.PHASE - data.PREDICTED) ** 2) / np.sum(
-            (data.PHASE - data.PHASE.mean()) ** 2
+            (data.PHASE - data.PHASE.mean()) ** 2,
         )
 
+    @staticmethod
     def score_Chi2(data: pd.DataFrame) -> float:
         return np.sum((data.PHASE - data.PREDICTED) ** 2 / (data.shape[0] - 3))
 
-    def score_p(self, data: pd.DataFrame) -> float:
-        return sp.stats.chisquare(data.PHASE, data.PREDICTED)[1]
-
+    @staticmethod
     def test_cramer(data: pd.DataFrame) -> float:
         try:
             res = sp.stats.cramervonmises_2samp(data.PHASE, data.PREDICTED)
@@ -485,199 +604,210 @@ class PhaseCenter:
             return np.nan
         return res.pvalue
 
+    @staticmethod
     def test_KS(data: pd.DataFrame) -> float:
-        res = sp.stats.ks_2samp(data.PHASE, data.PREDICTED)[1]
-        return res
+        return sp.stats.ks_2samp(data.PHASE, data.PREDICTED)[1]
 
+    @staticmethod
     def test_KS_res(data: pd.DataFrame) -> float:
-        res = data.PHASE - data.PREDICTED
-        test = sp.stats.kstest(res, sp.stats.norm.cdf)[1]
-        return test
+        return sp.stats.kstest(data.PHASE - data.PREDICTED, sp.stats.norm.cdf)[
+            1
+        ]
 
-    def score(self) -> "PhaseCenter":
-            """
-            Calculate various scores for the predicted data and update the best_fit attribute.
-
-            Returns:
-                PhaseCenter: The updated PhaseCenter object.
-            """
-            res = (
-                self.predicted.groupby(self.GROUPS)
-                .apply(
-                    lambda data: pd.Series(
-                        {
-                            "R2": PhaseCenter.score_R2(data),
-                            "Chi2": PhaseCenter.score_Chi2(data),
-                            "cramer": PhaseCenter.test_cramer(data),
-                            "KS": PhaseCenter.test_KS(data),
-                            "KS_res": PhaseCenter.test_KS_res(data),
-                        }
-                    )
-                )
-                .reset_index()
+    def score(self) -> PhaseCenter:
+        res = (
+            self.predicted.groupby(self.GROUPS)
+            .apply(
+                lambda data: pd.Series(
+                    {
+                        "R2": PhaseCenter.score_R2(data),
+                        "Chi2": PhaseCenter.score_Chi2(data),
+                        "cramer": PhaseCenter.test_cramer(data),
+                        "KS": PhaseCenter.test_KS(data),
+                        "KS_res": PhaseCenter.test_KS_res(data),
+                    },
+                ),
             )
-            self.best_fit = pd.merge(
-                self.best_fit, res, on=self.GROUPS, how="inner"
-            )
-            return self
-
-    def report(self):
-        """
-        Generates a report for the best fit parameters.
-
-        This method calculates various parameters based on the best fit values and returns the updated object.
-
-        Returns:
-            self: The updated object with calculated parameters.
-        """
-        
-        self.best_fit["Wavelength_cm"] = 100 * c / (self.best_fit["FREQ"] * 1e9)
-        self.best_fit["DZ"] = (
-            self.D0 / self.best_fit.Wavelength_cm - self.best_fit["DZ"] / 2 / np.pi
+            .reset_index()
         )
-        self.best_fit["DZ_err_low"] = self.best_fit["DZ_err_low"] * self.best_fit.DZ
-        self.best_fit["DZ_err_high"] = self.best_fit["DZ_err_high"] * self.best_fit.DZ
-        
-        self.best_fit["DXY"] = np.abs(self.best_fit["DXY"] / 2 / np.pi)
-        self.best_fit["DXY_err_low"] = self.best_fit["DXY_err_low"] * self.best_fit.DXY
-        self.best_fit["DXY_err_high"] = self.best_fit["DZ_err_high"] * self.best_fit.DXY
-        
-        params = [ "DZ", "DZ_err_low", "DZ_err_high", "DXY", "DXY_err_low", "DXY_err_high"]
-        params_phys = ["DZ_phys", "DZ_err_low_phys", "DZ_err_high_phys", "DXY_phys", "DXY_err_low_phys", "DXY_err_high_phys"]
-        
-        self.best_fit[params_phys] = self.best_fit[params].apply(lambda val: val * self.best_fit.Wavelength_cm)
-        
-        self.best_fit["PHI_0"] = np.degrees(self.best_fit["PHI_0"])
-        self.best_fit["PHI_0_err_low"] = np.degrees(self.best_fit["PHI_0_err_low"])
-        self.best_fit["PHI_0_err_high"] = np.degrees(self.best_fit["PHI_0_err_high"])
-        self.best_fit["Wavelength_cm"] = np.round(self.best_fit["Wavelength_cm"], 2)
+        self.best_fit = self.best_fit.merge(
+            res,
+            on=self.GROUPS,
+            how="inner",
+        )
         return self
 
-    def save(self, suffix=None, path="../data/processed"):
-        """
-        Save the best fit, predicted, and data as CSV files.
-
-        Args:
-            path (str, optional): The path to save the files. Defaults to "../data/processed".
-
-        Returns:
-            self: The current instance of the class.
-        """
-        timestamp = pd.Timestamp.now().strftime("%d_%M_%Y_%H_%M_%S")
-        self.best_fit.to_csv(f"{path}/best_fit_{timestamp}_{suffix}.csv", index=False)
-        self.predicted.to_csv(f"{path}/predicted_{timestamp}_{suffix}.csv", index=False)
-        self.data.to_csv(f"{path}/data_{timestamp}.csv", index=False)
-        return self
-
-    def plot_phase_center(self, ax=None, size=(8, 4)):
-        """
-        Plot the phase center data.
-
-        Parameters:
-        - ax (matplotlib.axes.Axes, optional): The axes to plot on. If not provided, a new figure with subplots will be created.
-
-        Returns:
-        - ax (matplotlib.axes.Axes): The axes object containing the plot.
-
-        """
-        if ax is None:
-            fig, ax = plt.subplots(nrows=2, ncols=2, figsize=size)
-        for name, data in self.best_fit.groupby(["DATASET", "WEIGHT", "SMOOTH", "METHOD"]):
-            yerr = data[["DZ_err_low", "DZ_err_high"]].apply(lambda val: np.abs(data.DZ - val)).T.values
-            yerr_phys = data[["DZ_err_low_phys", "DZ_err_high_phys"]].apply(lambda val: np.abs(data.DZ_phys - val)).T.values
-            yerr_XY = data[["DXY_err_low", "DXY_err_high"]].apply(lambda val: np.abs(data.DXY - val)).T.values
-            yerr_XY_phys = data[["DXY_err_low_phys", "DXY_err_high_phys"]].apply(lambda val: np.abs(data.DXY_phys - val)).T.values
-            ax[0, 0].errorbar(
-                1000 * data.FREQ,
+    def report(self) -> PhaseCenter:
+        self.best_fit["Wavelength_cm"] = self.best_fit.apply(
+            lambda data: np.round(PhaseCenter._wavelength_cm(data.FREQ), 2),
+            axis=1,
+        )
+        self.best_fit["DZ_lambda"] = self.best_fit.apply(
+            lambda data: PhaseCenter._DZ_lam(
                 data.DZ,
-                yerr=yerr,
-                color=get_color(name),
-                linewidth=get_linewidth(name),
-                linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
-            )
-            ax[0, 1].errorbar(
-                1000 * data.FREQ,
-                data.DZ_phys,
-                yerr=yerr_phys,
-                color=get_color(name),
-                linewidth=get_linewidth(name),
-                linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
-            )
-            ax[0, 0].set_xlabel("Frequency (MHz)")
-            ax[0, 0].set_ylabel(r"Phase Center $\Delta_z$ ($\lambda$)")
-            ax[0, 1].set_xlabel("Frequency (MHz)")
-            ax[0, 1].set_ylabel(r"Phase Center $\Delta_z$ (cm)")
-            yerr = data[["DXY_err_low", "DXY_err_high"]].T.values
-            yerr_phys = data[["DXY_err_low_phys", "DXY_err_high_phys"]].T.values
-            ax[1, 0].errorbar(
-                1000 * data.FREQ,
-                data.DXY,
-                yerr=yerr_XY,
-                color=get_color(name),
-                linewidth=get_linewidth(name),
-                linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
-            )
-            ax[1, 1].errorbar(
-                1000 * data.FREQ,
-                data.DXY_phys,
-                yerr=yerr_XY_phys,
-                color=get_color(name),
-                linewidth=get_linewidth(name),
-                linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
-            )
-            ax[1, 0].set_xlabel("Frequency (MHz)")
-            ax[1, 0].set_ylabel(r"Phase Center $\Delta_{XY}$ ($\lambda$)")
-            ax[1, 1].set_xlabel("Frequency (MHz)")
-            ax[1, 1].set_ylabel(r"Phase Center $\Delta_{XY}$ (cm)")
-            ax[1, 0].legend(loc="lower right", bbox_to_anchor=(1.8, -0.5), ncol=2)
+                self.D0,
+                data.FREQ,
+            ),
+            axis=1,
+        )
+        self.best_fit["DZ_err_low_lambda"] = self.best_fit.apply(
+            lambda data: PhaseCenter._DZ_err_lam(
+                data.DZ,
+                data.DZ_err_low,
+                data.FREQ,
+                self.D0,
+            ),
+            axis=1,
+        )
+        self.best_fit["DZ_err_high_lambda"] = self.best_fit.apply(
+            lambda data: PhaseCenter._DZ_err_lam(
+                data.DZ,
+                data.DZ_err_high,
+                data.FREQ,
+                self.D0,
+            ),
+            axis=1,
+        )
+        self.best_fit["DZ_phys"] = self.best_fit.apply(
+            lambda data: PhaseCenter._DZ_phys(
+                data.DZ,
+                self.D0,
+                data.FREQ,
+            ),
+            axis=1,
+        )
+        self.best_fit["DZ_err_low_phys"] = self.best_fit.apply(
+            lambda data: data.DZ_err_low_lambda
+            * PhaseCenter._wavelength_cm(data.FREQ),
+            axis=1,
+        )
+        self.best_fit["DZ_err_high_phys"] = self.best_fit.apply(
+            lambda data: data.DZ_err_high_lambda
+            * PhaseCenter._wavelength_cm(data.FREQ),
+            axis=1,
+        )
+        self.best_fit["DXY_lam"] = np.abs(self.best_fit["DXY"] / 2 / np.pi)
+        self.best_fit["DXY_lam_err_low"] = (
+            self.best_fit["DXY_err_low"] / 2 / np.pi
+        )
+        self.best_fit["DXY_lam_err_high"] = (
+            self.best_fit["DZ_err_high"] / 2 / np.pi
+        )
 
+        self.best_fit["DXY_phys"] = (
+            self.best_fit["DXY_lam"] * self.best_fit["Wavelength_cm"]
+        )
+        self.best_fit["DXY_err_low_phys"] = (
+            self.best_fit["DXY_lam_err_low"] * self.best_fit["Wavelength_cm"]
+        )
+        self.best_fit["DXY_err_high_phys"] = (
+            self.best_fit["DXY_lam_err_high"] * self.best_fit["Wavelength_cm"]
+        )
+
+        self.best_fit["PHI_0"] = np.degrees(self.best_fit["PHI_0"])
+        self.best_fit["PHI_0_err_low"] = np.degrees(
+            self.best_fit["PHI_0_err_low"],
+        )
+        self.best_fit["PHI_0_err_high"] = np.degrees(
+            self.best_fit["PHI_0_err_high"],
+        )
+        self.best_fit["Wavelength_cm"] = np.round(
+            self.best_fit["Wavelength_cm"],
+            2,
+        )
+        return self
+
+    def plot_phase_center(
+        self,
+        ax: plt.Axes | None = None,
+        size: tuple[int, int] = (12, 4),
+    ) -> plt.Axis:
+        _data = self.best_fit.query(
+            "WEIGHT == 's_Uniform' & SMOOTH == 'Smooth' & METHOD == 'OLS'",
+        )
+        colors = ["red", "blue"]
+        styles = ["-", "--", "-.", ":"]
+        if ax is None:
+            _, ax = plt.subplots(nrows=1, ncols=2, figsize=size)
+        __data = _data.sort_values(["DATASET", "BOOTSTRAP", "FREQ"])
+        groups = list(__data.groupby(["DATASET", "BOOTSTRAP"]).groups.keys())
+        for name, data in __data.groupby(["DATASET", "BOOTSTRAP"]):
+            _ax1 = ["DZ", "DZ_err_low", "DZ_err_high"]
+            _ax2 = ["DZ_phys", "DZ_err_low_phys", "DZ_err_high_phys"]
+            _axs = [_ax1, _ax2]
+            for ii, _ax in enumerate(_axs):
+                y = data[_ax[0]]
+                yerr = data[[_ax[1], _ax[2]]].T.to_numpy()
+                ax[ii].errorbar(
+                    1000 * data.FREQ,
+                    y,
+                    yerr=yerr,
+                    color=colors[groups.index(name) // 2],
+                    linestyle=styles[groups.index(name) // 2],
+                    label=f"Dataset: {name[0]}, Bootstrap: {name[1]}",
+                    fmt=".",
+                    capsize=3,
+                    linewidth=0.5,
+                )
+            ax[0].set_xlabel("Frequency (MHz)")
+            ax[0].set_ylabel(r"Phase Center $\Delta_{Z}$ ($k_0$)")
+            ax[1].set_xlabel("Frequency (MHz)")
+            ax[1].set_ylabel(r"Phase Center $\Delta_{Z_\mathrm{{Phys}}}$ (cm)")
+            ax[0].legend(
+                loc="lower right",
+                bbox_to_anchor=(1.5, -0.3),
+                ncol=2,
+            )
         return ax
 
-    def plot_statistics(self, ax=None, size=(8, 6)):
-        """
-        Plots various statistics using the provided axes.
-
-        Parameters:
-            ax (matplotlib.axes.Axes, optional): The axes to plot the statistics on. If not provided, a new figure with
-                subplots will be created.
-
-        Returns:
-            matplotlib.axes.Axes: The axes object containing the plotted statistics.
-        """
+    def plot_statistics(
+        self,
+        ax: plt.Axes = None,
+        size: tuple[int, int] = (12, 8),
+    ) -> plt.Axes:
+        _data = self.best_fit.query(
+            "WEIGHT == 's_Uniform' & SMOOTH == 'Smooth' & METHOD == 'OLS'",
+        )
+        __data = _data.sort_values(["DATASET", "BOOTSTRAP", "FREQ"])
+        groups = list(__data.groupby(["DATASET", "BOOTSTRAP"]).groups.keys())
+        colors = ["red", "blue"]
+        styles = ["-", "--", "-.", ":"]
         if ax is None:
             fig, ax = plt.subplots(nrows=3, ncols=2, figsize=size)
-
-        for name, data in self.best_fit.groupby(["DATASET", "WEIGHT", "SMOOTH", "METHOD"]):
-            
+        for name, data in _data.groupby(
+            ["DATASET", "BOOTSTRAP"],
+        ):
             ax[0, 0].plot(
                 1000 * data.FREQ,
                 data.R2,
-                color=get_color(name),
-                linewidth=get_linewidth(name),
-                linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
+                color=colors[groups.index(name) // 2],
+                # linewidth=get_linewidth(name),
+                linestyle=styles[groups.index(name) // 2],
+                label=f"Dataset: {name[0]}, Bootstrap: {name[1]}",
             )
             ax[0, 1].plot(
                 1000 * data.FREQ,
                 data.cramer,
-                color=get_color(name),
-                linewidth=get_linewidth(name),
-                linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
+                color=colors[groups.index(name) // 2],
+                # linewidth=get_linewidth(name),
+                linestyle=styles[groups.index(name) // 2],
+                label=f"Dataset: {name[0]}, Bootstrap: {name[1]}",
             )
             ax[1, 0].plot(
                 1000 * data.FREQ,
                 data.KS,
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
+                color=colors[groups.index(name) // 2],
+                # linewidth=get_linewidth(name),
+                linestyle=styles[groups.index(name) // 2],
+                label=f"Dataset: {name[0]}, Bootstrap: {name[1]}",
             )
             ax[1, 1].plot(
                 1000 * data.FREQ,
                 data.KS_res,
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
+                color=colors[groups.index(name) // 2],
+                # linewidth=get_linewidth(name),
+                linestyle=styles[groups.index(name) // 2],
+                label=f"Dataset: {name[0]}, Bootstrap: {name[1]}",
             )
             ax[0, 0].set_xlabel("Frequency (MHz)")
             ax[0, 0].set_ylabel(r"Coefficient of determination $R^2$")
@@ -692,13 +822,16 @@ class PhaseCenter:
             ax[2, 0].plot(
                 1000 * data.FREQ,
                 data.Chi2,
-                color=get_color(name),
-                linewidth=get_linewidth(name),
-                linestyle=get_linestyle(name),
-                label=f"Dataset: {name[0]}, Weights: {name[1]}, Smooth: {name[2]}, Method: {name[3]}",
+                color=colors[groups.index(name) // 2],
+                # linewidth=get_linewidth(name),
+                linestyle=styles[groups.index(name) // 2],
+                label=f"Dataset: {name[0]}, Bootstrap: {name[1]}",
             )
         lines_labels = [ax.get_legend_handles_labels() for ax in fig.axes]
-        lines, labels = [sum(lol, []) for lol in zip(*lines_labels)]
+        lines, labels = (
+            functools.reduce(operator.iadd, lol, [])
+            for lol in zip(*lines_labels)
+        )
 
         # grab unique labels
         unique_labels = set(labels)
@@ -709,27 +842,23 @@ class PhaseCenter:
         # query dict based on unique labels
         unique_lines = [legend_dict[x] for x in unique_labels]
 
-        ax[2, 0].legend(unique_lines, unique_labels, loc="lower right", bbox_to_anchor=(1.8, -0.4), ncol=2)
+        ax[2, 0].legend(
+            unique_lines,
+            unique_labels,
+            loc="lower right",
+            bbox_to_anchor=(1.8, -0.4),
+            ncol=2,
+        )
         return ax
 
-    def plot_phases(self, freqs=None, ncols=3, ax=None, size=None):
-        """
-        Plot the phases of the predicted data.
-
-        Parameters:
-        - freqs (list or None): List of frequencies to plot. If None, all unique frequencies in the best_fit data will be plotted.
-        - ncols (int): Number of columns in the subplot grid.
-        - ax (matplotlib.axes.Axes or None): Axes object to plot on. If None, a new figure and axes will be created.
-
-        Returns:
-        - ax (matplotlib.axes.Axes): The axes object containing the plotted phases.
-        """
-        if freqs is None:
-            freqs = self.best_fit.FREQ.unique()
-        ncols = 4
+    def plot_phases(
+        self,
+        freqs: list[float] | None = None,
+        ncols: int = 3,
+        ax: plt.Axes = None,
+    ) -> plt.Axes:
         nrows = int(np.ceil(2 * len(freqs) / ncols))
-        if size is None:
-            size = (8, 2 * nrows)
+        size = (12, 3 * nrows)
         if ax is None:
             fig, ax = plt.subplots(
                 nrows=nrows,
@@ -739,53 +868,44 @@ class PhaseCenter:
                 figsize=size,
                 gridspec_kw={"hspace": 0, "wspace": 0},
             )
-        jj = 0
-        kk = 0
-        for method, _dataset in self.predicted.groupby(["METHOD"]):
-            for pol, dataset in _dataset.groupby(["DATASET"]):
-                for name_, dataset_ in dataset.groupby(["WEIGHT", "SMOOTH"]):
-                    for ii, freq in enumerate(freqs):
-                        kk = ii + jj
-                        name = (method[0], pol[0], name_[0], name_[1])
-                        data = dataset_[dataset_.FREQ == freq].sort_values("ANGLE").copy()
-                        ax[kk // ncols, kk % ncols].plot(
-                            np.degrees(data.ANGLE),
-                            np.degrees(data.PHASE),
-                            color="black",
-                            linewidth=1.5,
-                            linestyle=":",
-                            alpha=0.5,
-                            label=f"Measured",
-                        )
-                        phase_smooth = self.data.query(
-                            f"FREQ == {freq} and DATASET == '{pol[0]}' and ANGLE <= {data.ANGLE.max()} and ANGLE >= {-data.ANGLE.max()}"
-                        )[["ANGLE", "PHASE_SM"]]
-                        ax[kk // ncols, kk % ncols].plot(
-                            np.degrees(phase_smooth.ANGLE),
-                            np.degrees(phase_smooth.PHASE_SM),
-                            color="violet",
-                            linewidth=1.5,
-                            alpha=0.5,
-                            label=f"Smoothed - Savitsky-Golay (Loess)",
-                        )
-                        ax[kk // ncols, kk % ncols].plot(
-                            np.degrees(data.ANGLE),
-                            np.degrees(data.PREDICTED),
-                            color=get_color(name),
-                            linewidth=get_linewidth(name),
-                            linestyle=get_linestyle(name),
-                            label=f"Predicted - Dataset: {pol[0]}, Weights: {name[1]}, Smooth: {name[2]}",
-                            alpha=0.3,
-                        )
-                        ax[kk // ncols, kk % ncols].set_title(
-                            f"Frequency: {freq * 1000:.0f} MHz - {pol[0]}",
-                        )
-                        ax[kk // ncols, kk % ncols].grid(
-                            color="gray", linestyle="--", linewidth=0.2
-                        )
+        _data = self.predicted.query(
+            "WEIGHT == 's_Uniform' and FREQ in @freqs",
+        ).sort_values(["DATASET", "BOOTSTRAP", "FREQ", "ANGLE"])
+        for name, _dataset in _data.groupby(
+            ["DATASET", "BOOTSTRAP", "SMOOTH", "FREQ"],
+        ):
+            if name[0] == "Horizontal_Copolar":
+                row = freqs.index(name[3]) // ncols
+                col = freqs.index(name[3]) % ncols
+                color = "red"
+            else:
+                row = (freqs.index(name[3]) + len(freqs)) // ncols
+                col = (freqs.index(name[3]) + len(freqs)) % ncols
+                color = "blue"
 
-                jj = kk + 1
-            jj = kk + 1
+            meas = self.data.query("DATASET == @name[0] & FREQ == @name[3]")[
+                ["ANGLE", "PHASE"]
+            ]
+            ax[row, col].scatter(
+                np.degrees(meas.ANGLE),
+                np.degrees(meas.PHASE),
+                color="black",
+                marker=".",
+                alpha=0.5,
+                label="Measured",
+            )
+            linewidth = 1 if name[1] == 500 else 0.5  # noqa: PLR2004
+            linestyle = "solid" if name[2] == "Smooth" else "dotted"
+            label = f"{name[0]} - {name[1]} - {name[2]}"
+            ax[row, col].plot(
+                np.degrees(_dataset.ANGLE),
+                np.degrees(_dataset.PREDICTED),
+                color=color,
+                linewidth=linewidth,
+                linestyle=linestyle,
+                alpha=0.5,
+                label=label,
+            )
 
         ax[0, 0].set_xlabel(
             r"$\theta$ (degrees)",
@@ -795,7 +915,10 @@ class PhaseCenter:
         )
 
         lines_labels = [ax.get_legend_handles_labels() for ax in fig.axes]
-        lines, labels = [sum(lol, []) for lol in zip(*lines_labels)]
+        lines, labels = (
+            functools.reduce(operator.iadd, lol, [])
+            for lol in zip(*lines_labels)
+        )
 
         # grab unique labels
         unique_labels = set(labels)
@@ -810,35 +933,26 @@ class PhaseCenter:
             unique_lines,
             unique_labels,
             loc="lower right",
-            bbox_to_anchor=(3.5, -0.6),
-            ncol=2,
+            bbox_to_anchor=(2.3, -0.5),
+            ncol=3,
+            fontsize=6,
         )
         return ax
 
-    def plot_residuals(self, freqs=None, ncols=3, ax=None):
-        """
-        Plot the residuals of the predicted phase compared to the measured phase.
-
-        Parameters:
-        - freqs (list or None): List of frequencies to plot. If None, all unique frequencies in the dataset will be plotted.
-        - ncols (int): Number of columns in the subplot grid.
-        - ax (matplotlib.axes.Axes or None): Axes object to plot on. If None, a new figure and axes will be created.
-
-        Returns:
-        - ax (matplotlib.axes.Axes): Axes object containing the plotted residuals.
-
-        """
-        if freqs is None:
-            freqs = self.best_fit.FREQ.unique()
+    def plot_residuals(
+        self,
+        freqs: list[float] | None = None,
+        ax: plt.Axes = None,
+    ) -> plt.Axes:
         ncols = 4
-        nrows = int(np.ceil(len(freqs) / ncols))
+        nrows = int(np.ceil(2 * len(freqs) / ncols))
         if ax is None:
             fig, ax = plt.subplots(
                 nrows=nrows,
                 ncols=ncols,
                 sharex=True,
                 sharey=True,
-                figsize=(8, 2 * nrows),
+                figsize=(12, 3 * nrows),
                 gridspec_kw={"hspace": 0, "wspace": 0},
             )
         markers = [
@@ -862,34 +976,40 @@ class PhaseCenter:
             "d",
         ]
         alpha = 0.5
-        dataset = self.predicted
-        for name_, dataset_ in dataset.groupby(["METHOD", "DATASET", "WEIGHT", "SMOOTH"]):
-            for ii, freq in enumerate(freqs):
-                data = dataset_[dataset_.FREQ == freq].sort_values("ANGLE").copy()
-                ll = list(
-                    dataset.groupby(["METHOD", "DATASET", "WEIGHT", "SMOOTH"]).groups.keys()
-                ).index(name_)
-                p1 = sm.ProbPlot(data.PHASE)
-                p2 = sm.ProbPlot(data.PREDICTED)
-                p1.qqplot(
-                    other=p2,
-                    line="45",
-                    xlabel="",
-                    ylabel="",
-                    **{
-                        "markersize": 2,
-                        "marker": markers[ll],
-                        "alpha": alpha,
-                        "label": f"Predicted - Dataset: {name_[0]}, Weights: {name_[1]}, Smooth: {name_[2]}",
-                    },
-                    ax=ax[ii // ncols, ii % ncols],
-                )
-                ax[ii // ncols, ii % ncols].grid(
-                    color="gray", linestyle="--", linewidth=0.2
-                )
-                ax[ii // ncols, ii % ncols].set_title(
-                    f"Frequency: {freq * 1000:.0f} MHz",
-                )
+        _data = self.predicted.query(
+            "WEIGHT == 's_Uniform' and FREQ in @freqs",
+        ).sort_values(["DATASET", "BOOTSTRAP", "FREQ", "ANGLE"])
+        groups = list(
+            _data.groupby(
+                ["DATASET", "BOOTSTRAP", "SMOOTH", "FREQ"]
+            ).groups.keys(),
+        )
+        for name, _dataset in _data.groupby(
+            ["DATASET", "BOOTSTRAP", "SMOOTH", "FREQ"],
+        ):
+            if name[0] == "Horizontal_Copolar":
+                row = freqs.index(name[3]) // ncols
+                col = freqs.index(name[3]) % ncols
+            else:
+                row = (freqs.index(name[3]) + len(freqs)) // ncols
+                col = (freqs.index(name[3]) + len(freqs)) % ncols
+            p1 = sm.ProbPlot(_dataset.PHASE)
+            p2 = sm.ProbPlot(_dataset.PREDICTED)
+            p1.qqplot(
+                other=p2,
+                line="45",
+                xlabel="",
+                ylabel="",
+                markersize=2,
+                marker=markers[groups.index(name) % len(markers)],
+                alpha=alpha,
+                label=f"Predicted - {name[0]}, {name[1]}, {name[2]}",
+                ax=ax[row, col],
+            )
+            ax[row, col].set_title(
+                f"Frequency: {1000 * name[3]} MHz", fontsize=6
+            )
+
         ax[0, 0].set_xlabel(
             xlabel="Measured Phase",
         )
@@ -897,7 +1017,10 @@ class PhaseCenter:
             ylabel="Predicted Phase",
         )
         lines_labels = [ax.get_legend_handles_labels() for ax in fig.axes]
-        lines, labels = [sum(lol, []) for lol in zip(*lines_labels)]
+        lines, labels = (
+            functools.reduce(operator.iadd, lol, [])
+            for lol in zip(*lines_labels)
+        )
 
         # grab unique labels
         unique_labels = set(labels)
@@ -912,90 +1035,93 @@ class PhaseCenter:
             unique_lines,
             unique_labels,
             loc="lower right",
-            bbox_to_anchor=(3.5, -0.6),
+            bbox_to_anchor=(2.5, -0.4),
             ncol=2,
+            fontsize=6,
         )
         return ax
 
-    def plot_qq_residuals(self, freqs=None, ncols=4, ax=None):
-        """
-        Plot quantile-quantile (QQ) residuals for different frequencies.
-
-        Parameters:
-        - freqs (list or None): List of frequencies to plot QQ residuals for. If None, all unique frequencies in the dataset will be used.
-        - ncols (int): Number of columns in the subplot grid.
-        - ax (matplotlib.axes.Axes or None): Axes object to plot the QQ residuals on. If None, a new figure and axes will be created.
-
-        Returns:
-        - ax (matplotlib.axes.Axes): Axes object containing the QQ residual plots.
-        """
-        markers = ["1", "o", "+", "D"]
-        freqs = self.best_fit.FREQ.unique()[::4]
-        if freqs is None:
-            freqs = self.best_fit.FREQ.unique()
+    def plot_qq_residuals(
+        self,
+        freqs: list[float] | None = None,
+        ax: plt.Axes = None,
+    ) -> plt.Axes:
         ncols = 4
         nrows = int(np.ceil(2 * len(freqs) / ncols))
-
-        fig, ax = plt.subplots(
-            nrows=nrows,
-            ncols=ncols,
-            sharex=True,
-            figsize=(8, 2 * nrows),
+        if ax is None:
+            fig, ax = plt.subplots(
+                nrows=nrows,
+                ncols=ncols,
+                sharex=True,
+                sharey=True,
+                figsize=(12, 3 * nrows),
+                gridspec_kw={"hspace": 0, "wspace": 0},
+            )
+        markers = [
+            "o",
+            "s",
+            "D",
+            "x",
+            ".",
+            "^",
+            ">",
+            "<",
+            "v",
+            "p",
+            "P",
+            "*",
+            "h",
+            "H",
+            "+",
+            "X",
+            "D",
+            "d",
+        ]
+        alpha = 0.5
+        _data = self.predicted.query(
+            "WEIGHT == 's_Uniform' and FREQ in @freqs",
+        ).sort_values(["DATASET", "BOOTSTRAP", "FREQ", "ANGLE"])
+        groups = list(
+            _data.groupby(
+                ["DATASET", "BOOTSTRAP", "SMOOTH", "FREQ"]
+            ).groups.keys(),
         )
-        kk = 0
-        jj = 0
-        for pol, dataset in self.predicted.groupby(["DATASET"]):
-            for name_, dataset_ in dataset.groupby(["WEIGHT", "SMOOTH", "METHOD"]):
-                for ii, freq in enumerate(freqs):
-                    kk = ii + jj
-                    ll = list(
-                        dataset.groupby(["WEIGHT", "SMOOTH", "METHOD"]).groups.keys()
-                    ).index(name_)
-                    name = (pol[0], name_[0], name_[1], name_[2])
-                    data = dataset_[dataset_.FREQ == freq]
-                    res = data.apply(
-                        lambda data: data.PHASE - data.PREDICTED, axis=1
-                    ).values
+        for name, _dataset in _data.groupby(
+            ["DATASET", "BOOTSTRAP", "SMOOTH", "FREQ"],
+        ):
+            if name[0] == "Horizontal_Copolar":
+                row = freqs.index(name[3]) // ncols
+                col = freqs.index(name[3]) % ncols
+            else:
+                row = (freqs.index(name[3]) + len(freqs)) // ncols
+                col = (freqs.index(name[3]) + len(freqs)) % ncols
 
-                    sm.qqplot(
-                        res,
-                        line="s",
-                        marker=markers[ll],
-                        markersize=2,
-                        ax=ax[kk // ncols, kk % ncols],
-                        label=f"{name_[1]} {name_[2]}",
-                    )
+            sm.qqplot(
+                _dataset.RESIDUALS,
+                line="s",
+                xlabel="",
+                ylabel="",
+                markersize=2,
+                marker=markers[groups.index(name) % len(markers)],
+                alpha=alpha,
+                label=f"Predicted - {name[0]}, {name[1]}, {name[2]}",
+                ax=ax[row, col],
+            )
+            ax[row, col].set_title(
+                f"Frequency: {1000 * name[3]} MHz", fontsize=6
+            )
 
-                    ax[kk // ncols, kk % ncols].grid(
-                        color="gray", linestyle="--", linewidth=0.2
-                    )
-                    ax[kk // ncols, kk % ncols].set_title(
-                        f"{freq * 1000:.0f} MHz - {name[0]}",
-                    )
-                    ax[kk // ncols, kk % ncols].set_xlabel(
-                        xlabel="",
-                    )
-                    ax[kk // ncols, kk % ncols].set_ylabel(
-                        ylabel="",
-                    )
-                    [
-                        item.set_fontsize(5)
-                        for item in ax[kk // ncols, kk % ncols].get_xticklabels()
-                    ]
-                    [
-                        item.set_fontsize(5)
-                        for item in ax[kk // ncols, kk % ncols].get_yticklabels()
-                    ]
-            jj = kk + 1
-        ax[nrows - 1, 0].set_xlabel(
-            xlabel="Theoretical Quantiles",
+        ax[0, 0].set_xlabel(
+            xlabel="Measured Phase",
         )
         ax[nrows - 1, 0].set_ylabel(
-            ylabel="Residues",
+            ylabel="Predicted Phase",
         )
-
         lines_labels = [ax.get_legend_handles_labels() for ax in fig.axes]
-        lines, labels = [sum(lol, []) for lol in zip(*lines_labels)]
+        lines, labels = (
+            functools.reduce(operator.iadd, lol, [])
+            for lol in zip(*lines_labels)
+        )
 
         # grab unique labels
         unique_labels = set(labels)
@@ -1010,51 +1136,8 @@ class PhaseCenter:
             unique_lines,
             unique_labels,
             loc="lower right",
-            bbox_to_anchor=(4, -0.5),
-            ncol=4,
+            bbox_to_anchor=(2.5, -0.4),
+            ncol=2,
+            fontsize=6,
         )
         return ax
-
-    def get_recent_file(path, mask):
-        """
-        Get the most recent file in a directory that matches a given mask.
-
-        Args:
-            path (str): The directory path to search for files.
-            mask (str): The file mask to match.
-
-        Returns:
-            str: The path of the most recent file.
-
-        Raises:
-            ValueError: If no files matching the mask are found in the directory.
-        """
-        files = list(Path(path).glob(mask))
-        if not files:
-            raise ValueError(f"No files matching the mask '{mask}' found in the directory '{path}'.")
-        file = max(files, key=lambda file: file.stat().st_ctime)
-        return file
-
-    def load(self, path, mask=None):
-        """
-        Load the data from CSV files.
-
-        Args:
-            path (str): The path to the directory containing the CSV files.
-            files (list): A list of file names to load. If None, default file names will be used.
-
-        Returns:
-            self: The PhaseCenter object with the loaded data.
-
-        """
-        masks = ["best_fit", "predicted", "data"]
-        if mask is None:
-            _mask = [__mask + "*.csv" for __mask in masks]
-            files = [PhaseCenter.get_recent_file(path, mask) for mask in _mask]
-        else:
-            _mask = [__mask + f"*{mask}*.csv" for __mask in masks]
-            files = [PhaseCenter.get_recent_file(path, mask) for mask in _mask]
-        self.best_fit = pd.read_csv(files[0])
-        self.predicted = pd.read_csv(files[1])
-        self.data = pd.read_csv(files[2])
-        return self
